@@ -25,25 +25,19 @@
 //                                                                            //
 ////////////////////////////////////////////////////////////////////////////////
 
-module cv32e40p_decoder
-  import cv32e40p_pkg::*;
-  import cv32e40p_apu_core_pkg::*;
-  import cv32e40p_fpu_pkg::*;
+module cv32e40p_decoder import cv32e40p_pkg::*; import cv32e40p_apu_core_pkg::*; import fpnew_pkg::*;
 #(
-  parameter COREV_PULP        = 1,              // PULP ISA Extension (including PULP specific CSRs and hardware loop, excluding cv.elw)
-  parameter COREV_CLUSTER     = 0,              // PULP ISA Extension cv.elw (need COREV_PULP = 1)
+  parameter PULP_XPULP        = 1,              // PULP ISA Extension (including PULP specific CSRs and hardware loop, excluding p.elw)
+  parameter PULP_CLUSTER      =  0,
   parameter A_EXTENSION       = 0,
   parameter FPU               = 0,
-  parameter FPU_ADDMUL_LAT    = 0,
-  parameter FPU_OTHERS_LAT    = 0,
-  parameter ZFINX             = 0,
   parameter PULP_SECURE       = 0,
   parameter USE_PMP           = 0,
   parameter APU_WOP_CPU       = 6,
   parameter DEBUG_TRIGGER_EN  = 1
 )
 (
-  // signals running to/from controller
+  // singals running to/from controller
   input  logic        deassert_we_i,           // deassert we, we are stalled or not active
 
   output logic        illegal_insn_o,          // illegal instruction encountered
@@ -86,7 +80,6 @@ module cv32e40p_decoder
   output logic [2:0]  alu_op_a_mux_sel_o,      // operand a selection: reg value, PC, immediate or zero
   output logic [2:0]  alu_op_b_mux_sel_o,      // operand b selection: reg value or immediate
   output logic [1:0]  alu_op_c_mux_sel_o,      // operand c selection: reg value or jump target
-  output logic        alu_vec_o,               // vectorial instruction
   output logic [1:0]  alu_vec_mode_o,          // selects between 32 bit, 16 bit and 8 bit vectorial modes
   output logic        scalar_replication_o,    // scalar replication enable
   output logic        scalar_replication_c_o,  // scalar replication enable for operand C
@@ -106,18 +99,17 @@ module cv32e40p_decoder
   output logic [1:0]  mult_dot_signed_o,       // Dot product in signed mode
 
   // FPU
-  input  logic            fs_off_i, // Floating-Point State field from MSTATUS
-  input  logic [C_RM-1:0] frm_i,    // Rounding mode from float CSR
+  input  logic [C_RM-1:0]             frm_i,   // Rounding mode from float CSR
 
-  output logic [cv32e40p_fpu_pkg::FP_FORMAT_BITS-1:0]  fpu_dst_fmt_o,   // fpu destination format
-  output logic [cv32e40p_fpu_pkg::FP_FORMAT_BITS-1:0]  fpu_src_fmt_o,   // fpu source format
-  output logic [cv32e40p_fpu_pkg::INT_FORMAT_BITS-1:0] fpu_int_fmt_o,   // fpu integer format (for casts)
+  output logic [fpnew_pkg::FP_FORMAT_BITS-1:0]  fpu_dst_fmt_o,   // fpu destination format
+  output logic [fpnew_pkg::FP_FORMAT_BITS-1:0]  fpu_src_fmt_o,   // fpu source format
+  output logic [fpnew_pkg::INT_FORMAT_BITS-1:0] fpu_int_fmt_o,   // fpu integer format (for casts)
 
   // APU
-  output logic                   apu_en_o,
-  output logic [APU_WOP_CPU-1:0] apu_op_o,
-  output logic [1:0]             apu_lat_o,
-  output logic [2:0]             fp_rnd_mode_o,
+  output logic                apu_en_o,
+  output logic [APU_WOP_CPU-1:0]  apu_op_o,
+  output logic [1:0]          apu_lat_o,
+  output logic [2:0]          fp_rnd_mode_o,
 
   // register file related signals
   output logic        regfile_mem_we_o,        // write enable for regfile
@@ -141,12 +133,12 @@ module cv32e40p_decoder
   output logic        data_load_event_o,       // data request is in the special event range
 
   // Atomic memory access
-  output logic [5:0] atop_o,
+  output  logic [5:0] atop_o,
 
   // hwloop signals
   output logic [2:0]  hwlp_we_o,               // write enable for hwloop regs
-  output logic [1:0]  hwlp_target_mux_sel_o,   // selects immediate for hwloop target
-  output logic [1:0]  hwlp_start_mux_sel_o,    // selects hwloop start address input
+  output logic        hwlp_target_mux_sel_o,   // selects immediate for hwloop target
+  output logic        hwlp_start_mux_sel_o,    // selects hwloop start address input
   output logic        hwlp_cnt_mux_sel_o,      // selects hwloop counter input
 
   input  logic        debug_mode_i,            // processor is in debug mode
@@ -179,9 +171,9 @@ module cv32e40p_decoder
   // this instruction needs floating-point rounding-mode verification
   logic check_fprm;
 
-  logic [cv32e40p_fpu_pkg::OP_BITS-1:0] fpu_op;     // fpu operation
-  logic                                 fpu_op_mod; // fpu operation modifier
-  logic                                 fpu_vec_op; // fpu vectorial operation
+  logic [fpnew_pkg::OP_BITS-1:0] fpu_op;     // fpu operation
+  logic                      fpu_op_mod; // fpu operation modifier
+  logic                      fpu_vec_op; // fpu vectorial operation
   // unittypes for latencies to help us decode for APU
   enum logic[1:0] {ADDMUL, DIVSQRT, NONCOMP, CONV} fp_op_group;
 
@@ -196,99 +188,98 @@ module cv32e40p_decoder
   /////////////////////////////////////////////
 
   always_comb
-  begin: instruction_decoder
-    ctrl_transfer_insn             = BRANCH_NONE;
-    ctrl_transfer_target_mux_sel_o = JT_JAL;
+  begin
+    ctrl_transfer_insn          = BRANCH_NONE;
+    ctrl_transfer_target_mux_sel_o       = JT_JAL;
 
-    alu_en                         = 1'b1;
-    alu_operator_o                 = ALU_SLTU;
-    alu_op_a_mux_sel_o             = OP_A_REGA_OR_FWD;
-    alu_op_b_mux_sel_o             = OP_B_REGB_OR_FWD;
-    alu_op_c_mux_sel_o             = OP_C_REGC_OR_FWD;
-    alu_vec_o                      = 1'b0;
-    alu_vec_mode_o                 = VEC_MODE32;
-    scalar_replication_o           = 1'b0;
-    scalar_replication_c_o         = 1'b0;
-    regc_mux_o                     = REGC_ZERO;
-    imm_a_mux_sel_o                = IMMA_ZERO;
-    imm_b_mux_sel_o                = IMMB_I;
+    alu_en                      = 1'b1;
+    alu_operator_o              = ALU_SLTU;
+    alu_op_a_mux_sel_o          = OP_A_REGA_OR_FWD;
+    alu_op_b_mux_sel_o          = OP_B_REGB_OR_FWD;
+    alu_op_c_mux_sel_o          = OP_C_REGC_OR_FWD;
+    alu_vec_mode_o              = VEC_MODE32;
+    scalar_replication_o        = 1'b0;
+    scalar_replication_c_o      = 1'b0;
+    regc_mux_o                  = REGC_ZERO;
+    imm_a_mux_sel_o             = IMMA_ZERO;
+    imm_b_mux_sel_o             = IMMB_I;
 
-    mult_int_en                    = 1'b0;
-    mult_dot_en                    = 1'b0;
-    mult_operator_o                = MUL_I;
-    mult_imm_mux_o                 = MIMM_ZERO;
-    mult_signed_mode_o             = 2'b00;
-    mult_sel_subword_o             = 1'b0;
-    mult_dot_signed_o              = 2'b00;
+    mult_operator_o             = MUL_I;
+    mult_int_en                 = 1'b0;
+    mult_dot_en                 = 1'b0;
+    mult_imm_mux_o              = MIMM_ZERO;
+    mult_signed_mode_o          = 2'b00;
+    mult_sel_subword_o          = 1'b0;
+    mult_dot_signed_o           = 2'b00;
 
-    apu_en                         = 1'b0;
-    apu_op_o                       = '0;
-    apu_lat_o                      = '0;
-    fp_rnd_mode_o                  = '0;
-    fpu_op                         = cv32e40p_fpu_pkg::SGNJ;
-    fpu_op_mod                     = 1'b0;
-    fpu_vec_op                     = 1'b0;
-    fpu_dst_fmt_o                  = cv32e40p_fpu_pkg::FP32;
-    fpu_src_fmt_o                  = cv32e40p_fpu_pkg::FP32;
-    fpu_int_fmt_o                  = cv32e40p_fpu_pkg::INT32;
-    check_fprm                     = 1'b0;
-    fp_op_group                    = ADDMUL;
+    apu_en                      = 1'b0;
+    apu_op_o                    = '0;
+    apu_lat_o                   = '0;
+    fp_rnd_mode_o               = '0;
+    fpu_op                      = fpnew_pkg::SGNJ;
+    fpu_op_mod                  = 1'b0;
+    fpu_vec_op                  = 1'b0;
+    fpu_dst_fmt_o               = fpnew_pkg::FP32;
+    fpu_src_fmt_o               = fpnew_pkg::FP32;
+    fpu_int_fmt_o               = fpnew_pkg::INT32;
+    check_fprm                  = 1'b0;
+    fp_op_group                 = ADDMUL;
 
-    regfile_mem_we                 = 1'b0;
-    regfile_alu_we                 = 1'b0;
-    regfile_alu_waddr_sel_o        = 1'b1;
+    regfile_mem_we              = 1'b0;
+    regfile_alu_we              = 1'b0;
+    regfile_alu_waddr_sel_o     = 1'b1;
 
-    prepost_useincr_o              = 1'b1;
+    prepost_useincr_o           = 1'b1;
 
-    hwlp_we                        = 3'b0;
-    hwlp_target_mux_sel_o          = 2'b0;
-    hwlp_start_mux_sel_o           = 2'b0;
-    hwlp_cnt_mux_sel_o             = 1'b0;
+    hwlp_we                     = 3'b0;
+    hwlp_target_mux_sel_o       = 1'b0;
+    hwlp_start_mux_sel_o        = 1'b0;
+    hwlp_cnt_mux_sel_o          = 1'b0;
 
-    csr_access_o                   = 1'b0;
-    csr_status_o                   = 1'b0;
-    csr_illegal                    = 1'b0;
-    csr_op                         = CSR_OP_READ;
-    mret_insn_o                    = 1'b0;
-    uret_insn_o                    = 1'b0;
+    csr_access_o                = 1'b0;
+    csr_status_o                = 1'b0;
+    csr_illegal                 = 1'b0;
+    csr_op                      = CSR_OP_READ;
+    mret_insn_o                 = 1'b0;
+    uret_insn_o                 = 1'b0;
 
-    dret_insn_o                    = 1'b0;
+    dret_insn_o                 = 1'b0;
 
-    data_we_o                      = 1'b0;
-    data_type_o                    = 2'b00;
-    data_sign_extension_o          = 2'b00;
-    data_reg_offset_o              = 2'b00;
-    data_req                       = 1'b0;
-    data_load_event_o              = 1'b0;
+    data_we_o                   = 1'b0;
+    data_type_o                 = 2'b00;
+    data_sign_extension_o       = 2'b00;
+    data_reg_offset_o           = 2'b00;
+    data_req                    = 1'b0;
+    data_load_event_o           = 1'b0;
 
-    atop_o                         = 6'b000000;
+    atop_o                      = 6'b000000;
 
-    illegal_insn_o                 = 1'b0;
-    ebrk_insn_o                    = 1'b0;
-    ecall_insn_o                   = 1'b0;
-    wfi_o                          = 1'b0;
+    illegal_insn_o              = 1'b0;
+    ebrk_insn_o                 = 1'b0;
+    ecall_insn_o                = 1'b0;
+    wfi_o                       = 1'b0;
 
-    fencei_insn_o                  = 1'b0;
+    fencei_insn_o               = 1'b0;
 
-    rega_used_o                    = 1'b0;
-    regb_used_o                    = 1'b0;
-    regc_used_o                    = 1'b0;
-    reg_fp_a_o                     = 1'b0;
-    reg_fp_b_o                     = 1'b0;
-    reg_fp_c_o                     = 1'b0;
-    reg_fp_d_o                     = 1'b0;
+    rega_used_o                 = 1'b0;
+    regb_used_o                 = 1'b0;
+    regc_used_o                 = 1'b0;
+    reg_fp_a_o                  = 1'b0;
+    reg_fp_b_o                  = 1'b0;
+    reg_fp_c_o                  = 1'b0;
+    reg_fp_d_o                  = 1'b0;
 
-    bmask_a_mux_o                  = BMASK_A_ZERO;
-    bmask_b_mux_o                  = BMASK_B_ZERO;
-    alu_bmask_a_mux_sel_o          = BMASK_A_IMM;
-    alu_bmask_b_mux_sel_o          = BMASK_B_IMM;
+    bmask_a_mux_o               = BMASK_A_ZERO;
+    bmask_b_mux_o               = BMASK_B_ZERO;
+    alu_bmask_a_mux_sel_o       = BMASK_A_IMM;
+    alu_bmask_b_mux_sel_o       = BMASK_B_IMM;
 
-    is_clpx_o                      = 1'b0;
-    is_subrot_o                    = 1'b0;
+    is_clpx_o                   = 1'b0;
+    is_subrot_o                 = 1'b0;
 
-    mret_dec_o                     = 1'b0;
-    uret_dec_o                     = 1'b0;
-    dret_dec_o                     = 1'b0;
+    mret_dec_o                  = 1'b0;
+    uret_dec_o                  = 1'b0;
+    dret_dec_o                  = 1'b0;
 
     unique case (instr_rdata_i[6:0])
 
@@ -334,19 +325,38 @@ module cv32e40p_decoder
 
       OPCODE_BRANCH: begin // Branch
         ctrl_transfer_target_mux_sel_o = JT_COND;
-        ctrl_transfer_insn             = BRANCH_COND;
-        alu_op_c_mux_sel_o             = OP_C_JT;
-        rega_used_o                    = 1'b1;
-        regb_used_o                    = 1'b1;
+        ctrl_transfer_insn    = BRANCH_COND;
+        alu_op_c_mux_sel_o    = OP_C_JT;
+        rega_used_o           = 1'b1;
+        regb_used_o           = 1'b1;
 
         unique case (instr_rdata_i[14:12])
-          3'b000 : alu_operator_o = ALU_EQ;
-          3'b001 : alu_operator_o = ALU_NE;
-          3'b100 : alu_operator_o = ALU_LTS;
-          3'b101 : alu_operator_o = ALU_GES;
-          3'b110 : alu_operator_o = ALU_LTU;
-          3'b111 : alu_operator_o = ALU_GEU;
-          default: illegal_insn_o = 1'b1;
+          3'b000: alu_operator_o = ALU_EQ;
+          3'b001: alu_operator_o = ALU_NE;
+          3'b100: alu_operator_o = ALU_LTS;
+          3'b101: alu_operator_o = ALU_GES;
+          3'b110: alu_operator_o = ALU_LTU;
+          3'b111: alu_operator_o = ALU_GEU;
+          3'b010: begin // p.beqimm
+            if (PULP_XPULP) begin
+              alu_operator_o      = ALU_EQ;
+              regb_used_o         = 1'b0;
+              alu_op_b_mux_sel_o  = OP_B_IMM;
+              imm_b_mux_sel_o     = IMMB_BI;
+            end else begin
+              illegal_insn_o = 1'b1;
+            end
+          end
+          3'b011: begin // p.bneimm
+            if (PULP_XPULP) begin
+              alu_operator_o      = ALU_NE;
+              regb_used_o         = 1'b0;
+              alu_op_b_mux_sel_o  = OP_B_IMM;
+              imm_b_mux_sel_o     = IMMB_BI;
+            end else begin
+              illegal_insn_o = 1'b1;
+            end
+          end
         endcase
       end
 
@@ -360,52 +370,128 @@ module cv32e40p_decoder
       //                              //
       //////////////////////////////////
 
-      OPCODE_STORE: begin
-        data_req           = 1'b1;
-        data_we_o          = 1'b1;
-        rega_used_o        = 1'b1;
-        regb_used_o        = 1'b1;
-        alu_operator_o     = ALU_ADD;
-        // pass write data through ALU operand c
-        alu_op_c_mux_sel_o = OP_C_REGB_OR_FWD;
-        // offset from immediate
-        imm_b_mux_sel_o    = IMMB_S;
-        alu_op_b_mux_sel_o = OP_B_IMM;
+      OPCODE_STORE,
+      OPCODE_STORE_POST: begin
+        if (PULP_XPULP || (instr_rdata_i[6:0] == OPCODE_STORE)) begin
+          data_req       = 1'b1;
+          data_we_o      = 1'b1;
+          rega_used_o    = 1'b1;
+          regb_used_o    = 1'b1;
+          alu_operator_o = ALU_ADD;
+          // pass write data through ALU operand c
+          alu_op_c_mux_sel_o = OP_C_REGB_OR_FWD;
 
-        // store size
-        unique case (instr_rdata_i[14:12])
-          3'b000 : data_type_o = 2'b10; // SB
-          3'b001 : data_type_o = 2'b01; // SH
-          3'b010 : data_type_o = 2'b00; // SW
-          default: begin
-            illegal_insn_o = 1'b1;
-            data_req       = 1'b0;
-            data_we_o      = 1'b0;
+          // post-increment setup
+          if (instr_rdata_i[6:0] == OPCODE_STORE_POST) begin
+            prepost_useincr_o       = 1'b0;
+            regfile_alu_waddr_sel_o = 1'b0;
+            regfile_alu_we          = 1'b1;
           end
-        endcase
+
+          if (instr_rdata_i[14] == 1'b0) begin
+            // offset from immediate
+            imm_b_mux_sel_o     = IMMB_S;
+            alu_op_b_mux_sel_o  = OP_B_IMM;
+          end else begin
+            if (PULP_XPULP) begin
+              // offset from register
+              regc_used_o        = 1'b1;
+              alu_op_b_mux_sel_o = OP_B_REGC_OR_FWD;
+              regc_mux_o         = REGC_RD;
+            end else begin
+              illegal_insn_o = 1'b1;
+            end
+          end
+
+          // store size
+          unique case (instr_rdata_i[13:12])
+            2'b00: data_type_o = 2'b10; // SB
+            2'b01: data_type_o = 2'b01; // SH
+            2'b10: data_type_o = 2'b00; // SW
+            default: begin
+              data_req       = 1'b0;
+              data_we_o      = 1'b0;
+              illegal_insn_o = 1'b1;
+            end
+          endcase
+        end else begin
+          illegal_insn_o = 1'b1;
+        end
       end
 
-      OPCODE_LOAD: begin
-        data_req           = 1'b1;
-        regfile_mem_we     = 1'b1;
-        rega_used_o        = 1'b1;
-        alu_operator_o     = ALU_ADD;
-        // offset from immediate
-        alu_op_b_mux_sel_o = OP_B_IMM;
-        imm_b_mux_sel_o    = IMMB_I;
+      OPCODE_LOAD,
+      OPCODE_LOAD_POST: begin
+        if (PULP_XPULP || (instr_rdata_i[6:0] == OPCODE_LOAD)) begin
+          data_req        = 1'b1;
+          regfile_mem_we  = 1'b1;
+          rega_used_o     = 1'b1;
+          data_type_o     = 2'b00;
+          // offset from immediate
+          alu_operator_o      = ALU_ADD;
+          alu_op_b_mux_sel_o  = OP_B_IMM;
+          imm_b_mux_sel_o     = IMMB_I;
 
-        // sign/zero extension
-        data_sign_extension_o = {1'b0,~instr_rdata_i[14]};
+          // post-increment setup
+          if (instr_rdata_i[6:0] == OPCODE_LOAD_POST) begin
+            prepost_useincr_o       = 1'b0;
+            regfile_alu_waddr_sel_o = 1'b0;
+            regfile_alu_we          = 1'b1;
+          end
 
-        // load size
-        unique case (instr_rdata_i[14:12])
-          3'b000, 3'b100: data_type_o = 2'b10; // LB/LBU
-          3'b001, 3'b101: data_type_o = 2'b01; // LH/LHU
-          3'b010        : data_type_o = 2'b00; // LW
-          default: begin
+          // sign/zero extension
+          data_sign_extension_o = {1'b0,~instr_rdata_i[14]};
+
+          // load size
+          unique case (instr_rdata_i[13:12])
+            2'b00:   data_type_o = 2'b10; // LB
+            2'b01:   data_type_o = 2'b01; // LH
+            2'b10:   data_type_o = 2'b00; // LW
+            default: data_type_o = 2'b00; // illegal or reg-reg
+          endcase
+
+          // reg-reg load (different encoding)
+          if (instr_rdata_i[14:12] == 3'b111) begin
+            if (PULP_XPULP) begin
+              // offset from RS2
+              regb_used_o        = 1'b1;
+              alu_op_b_mux_sel_o = OP_B_REGB_OR_FWD;
+
+              // sign/zero extension
+              data_sign_extension_o = {1'b0, ~instr_rdata_i[30]};
+
+              // load size
+              unique case (instr_rdata_i[31:25])
+                7'b0000_000,
+                7'b0100_000: data_type_o = 2'b10; // LB, LBU
+                7'b0001_000,
+                7'b0101_000: data_type_o = 2'b01; // LH, LHU
+                7'b0010_000: data_type_o = 2'b00; // LW
+                default: begin
+                  illegal_insn_o = 1'b1;
+                end
+              endcase
+            end else begin
+              illegal_insn_o = 1'b1;
+            end
+          end
+
+          // special p.elw (event load)
+          if (instr_rdata_i[14:12] == 3'b110) begin
+            if (PULP_CLUSTER && (instr_rdata_i[6:0] == OPCODE_LOAD)) begin
+              data_load_event_o = 1'b1;
+            end else begin
+              // p.elw only valid for PULP_CLUSTER = 1; p.elw with post increment does not exist
+              illegal_insn_o = 1'b1;
+            end
+          end
+
+          if (instr_rdata_i[14:12] == 3'b011) begin
+            // LD -> RV64 only
             illegal_insn_o = 1'b1;
           end
-        endcase
+        end else begin
+          illegal_insn_o = 1'b1;
+        end
       end
 
       OPCODE_AMO: begin
@@ -451,6 +537,7 @@ module cv32e40p_decoder
           illegal_insn_o = 1'b1;
         end
       end
+
 
       //////////////////////////
       //     _    _    _   _  //
@@ -511,39 +598,146 @@ module cv32e40p_decoder
         endcase
       end
 
-      OPCODE_OP: begin
+      OPCODE_OP: begin  // Register-Register ALU operation
 
         // PREFIX 11
         if (instr_rdata_i[31:30] == 2'b11) begin
-          illegal_insn_o = 1'b1;
+          if (PULP_XPULP) begin
+            //////////////////////////////
+            // IMMEDIATE BIT-MANIPULATION
+            //////////////////////////////
+
+            regfile_alu_we = 1'b1;
+            rega_used_o    = 1'b1;
+
+            // bit-manipulation instructions
+            bmask_a_mux_o       = BMASK_A_S3;
+            bmask_b_mux_o       = BMASK_B_S2;
+            alu_op_b_mux_sel_o  = OP_B_IMM;
+
+            unique case (instr_rdata_i[14:12])
+              3'b000: begin
+                alu_operator_o  = ALU_BEXT;
+                imm_b_mux_sel_o = IMMB_S2;
+                bmask_b_mux_o   = BMASK_B_ZERO;
+              end
+              3'b001: begin
+                alu_operator_o  = ALU_BEXTU;
+                imm_b_mux_sel_o = IMMB_S2;
+                bmask_b_mux_o   = BMASK_B_ZERO;
+              end
+              3'b010: begin
+                alu_operator_o  = ALU_BINS;
+                imm_b_mux_sel_o = IMMB_S2;
+                regc_used_o     = 1'b1;
+                regc_mux_o      = REGC_RD;
+              end
+              3'b011: begin
+                alu_operator_o = ALU_BCLR;
+              end
+              3'b100: begin
+                alu_operator_o = ALU_BSET;
+              end
+              3'b101: begin
+                alu_operator_o        = ALU_BREV;
+                // Enable write back to RD
+                regc_used_o           = 1'b1;
+                regc_mux_o            = REGC_RD;
+                // Extract the source register on operand a
+                imm_b_mux_sel_o       = IMMB_S2;
+                // Map the radix to bmask_a immediate
+                alu_bmask_a_mux_sel_o = BMASK_A_IMM;
+                if (instr_rdata_i[29:27] != 3'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end
+              default: illegal_insn_o = 1'b1;
+            endcase
+          end else begin
+            illegal_insn_o = 1'b1;
+          end
+        end
 
         // PREFIX 10
-        end else if (instr_rdata_i[31:30] == 2'b10) begin
-          if (instr_rdata_i[29:25] == 5'b00000) begin
-            illegal_insn_o = 1'b1;
+        else if (instr_rdata_i[31:30] == 2'b10) begin
+          //////////////////////////////
+          // REGISTER BIT-MANIPULATION
+          //////////////////////////////
+          if (instr_rdata_i[29:25]==5'b00000) begin
+            if (PULP_XPULP) begin
+              regfile_alu_we = 1'b1;
+              rega_used_o    = 1'b1;
+
+              bmask_a_mux_o       = BMASK_A_S3;
+              bmask_b_mux_o       = BMASK_B_S2;
+              alu_op_b_mux_sel_o  = OP_B_IMM;
+
+              unique case (instr_rdata_i[14:12])
+                3'b000: begin
+                  alu_operator_o  = ALU_BEXT;
+                  imm_b_mux_sel_o = IMMB_S2;
+                  bmask_b_mux_o   = BMASK_B_ZERO;
+                  //register variant
+                  alu_op_b_mux_sel_o     = OP_B_BMASK;
+                  alu_bmask_a_mux_sel_o  = BMASK_A_REG;
+                  regb_used_o            = 1'b1;
+                end
+                3'b001: begin
+                  alu_operator_o  = ALU_BEXTU;
+                  imm_b_mux_sel_o = IMMB_S2;
+                  bmask_b_mux_o   = BMASK_B_ZERO;
+                  //register variant
+                  alu_op_b_mux_sel_o     = OP_B_BMASK;
+                  alu_bmask_a_mux_sel_o  = BMASK_A_REG;
+                  regb_used_o            = 1'b1;
+                end
+                3'b010: begin
+                  alu_operator_o      = ALU_BINS;
+                  imm_b_mux_sel_o     = IMMB_S2;
+                  regc_used_o         = 1'b1;
+                  regc_mux_o          = REGC_RD;
+                  //register variant
+                  alu_op_b_mux_sel_o     = OP_B_BMASK;
+                  alu_bmask_a_mux_sel_o  = BMASK_A_REG;
+                  alu_bmask_b_mux_sel_o  = BMASK_B_REG;
+                  regb_used_o            = 1'b1;
+                end
+                3'b011: begin
+                  alu_operator_o = ALU_BCLR;
+                  //register variant
+                  regb_used_o            = 1'b1;
+                  alu_bmask_a_mux_sel_o  = BMASK_A_REG;
+                  alu_bmask_b_mux_sel_o  = BMASK_B_REG;
+                end
+                3'b100: begin
+                  alu_operator_o = ALU_BSET;
+                  //register variant
+                  regb_used_o            = 1'b1;
+                  alu_bmask_a_mux_sel_o  = BMASK_A_REG;
+                  alu_bmask_b_mux_sel_o  = BMASK_B_REG;
+                end
+                default: illegal_insn_o = 1'b1;
+              endcase
+            end else begin
+              illegal_insn_o = 1'b1;
+            end
 
           ///////////////////////
           // VECTORIAL FLOAT OPS
           ///////////////////////
           end else begin
-            // Vectorial FP
-            if (FPU == 1 && C_XFVEC == 1) begin
+            // Vectorial FP not available in 'old' shared FPU
+            if (FPU==1 && C_XFVEC) begin
 
               // using APU instead of ALU
-              alu_en           = 1'b0;
               apu_en           = 1'b1;
+              alu_en           = 1'b0;
               // by default, set all registers to FP registers and use 2
               rega_used_o      = 1'b1;
               regb_used_o      = 1'b1;
-              if (ZFINX == 0) begin
-                reg_fp_a_o     = 1'b1;
-                reg_fp_b_o     = 1'b1;
-                reg_fp_d_o     = 1'b1;
-              end else begin
-                reg_fp_a_o     = 1'b0;
-                reg_fp_b_o     = 1'b0;
-                reg_fp_d_o     = 1'b0;
-              end
+              reg_fp_a_o       = 1'b1;
+              reg_fp_b_o       = 1'b1;
+              reg_fp_d_o       = 1'b1;
               fpu_vec_op       = 1'b1;
               // replication bit comes from instruction (can change for some ops)
               scalar_replication_o = instr_rdata_i[14];
@@ -555,22 +749,22 @@ module cv32e40p_decoder
               unique case (instr_rdata_i[13:12])
                 // FP32
                 2'b00: begin
-                  fpu_dst_fmt_o  = cv32e40p_fpu_pkg::FP32;
+                  fpu_dst_fmt_o  = fpnew_pkg::FP32;
                   alu_vec_mode_o = VEC_MODE32;
                 end
                 // FP16ALT
                 2'b01: begin
-                  fpu_dst_fmt_o  = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_dst_fmt_o  = fpnew_pkg::FP16ALT;
                   alu_vec_mode_o = VEC_MODE16;
                 end
                 // FP16
                 2'b10: begin
-                  fpu_dst_fmt_o  = cv32e40p_fpu_pkg::FP16;
+                  fpu_dst_fmt_o  = fpnew_pkg::FP16;
                   alu_vec_mode_o = VEC_MODE16;
                 end
                 // FP8
                 2'b11: begin
-                  fpu_dst_fmt_o  = cv32e40p_fpu_pkg::FP8;
+                  fpu_dst_fmt_o  = fpnew_pkg::FP8;
                   alu_vec_mode_o = VEC_MODE8;
                 end
               endcase
@@ -582,7 +776,7 @@ module cv32e40p_decoder
               unique case (instr_rdata_i[29:25]) inside
                 // vfadd.vfmt - Vectorial FP Addition
                 5'b00001: begin
-                  fpu_op      = cv32e40p_fpu_pkg::ADD;
+                  fpu_op      = fpnew_pkg::ADD;
                   fp_op_group = ADDMUL;
                   // FPnew needs addition operands as operand B and C
                   alu_op_b_mux_sel_o     = OP_B_REGA_OR_FWD;
@@ -592,7 +786,7 @@ module cv32e40p_decoder
                 end
                 // vfsub.vfmt - Vectorial FP Subtraction
                 5'b00010: begin
-                  fpu_op      = cv32e40p_fpu_pkg::ADD;
+                  fpu_op      = fpnew_pkg::ADD;
                   fpu_op_mod  = 1'b1;
                   fp_op_group = ADDMUL;
                   // FPnew needs addition operands as operand B and C
@@ -603,24 +797,24 @@ module cv32e40p_decoder
                 end
                 // vfmul.vfmt - Vectorial FP Multiplication
                 5'b00011: begin
-                  fpu_op      = cv32e40p_fpu_pkg::MUL;
+                  fpu_op      = fpnew_pkg::MUL;
                   fp_op_group = ADDMUL;
                 end
                 // vfdiv.vfmt - Vectorial FP Division
                 5'b00100: begin
-                  fpu_op      = cv32e40p_fpu_pkg::DIV;
+                  fpu_op      = fpnew_pkg::DIV;
                   fp_op_group = DIVSQRT;
                 end
                 // vfmin.vfmt - Vectorial FP Minimum
                 5'b00101: begin
-                  fpu_op        = cv32e40p_fpu_pkg::MINMAX;
+                  fpu_op        = fpnew_pkg::MINMAX;
                   fp_rnd_mode_o = 3'b000; // min
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0; // instruction encoded in rm
                 end
                 // vfmax.vfmt - Vectorial FP Maximum
                 5'b00110: begin
-                  fpu_op        = cv32e40p_fpu_pkg::MINMAX;
+                  fpu_op        = fpnew_pkg::MINMAX;
                   fp_rnd_mode_o = 3'b001; // max
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0; // instruction encoded in rm
@@ -628,7 +822,7 @@ module cv32e40p_decoder
                 // vfsqrt.vfmt - Vectorial FP Square Root
                 5'b00111: begin
                   regb_used_o = 1'b0;
-                  fpu_op      = cv32e40p_fpu_pkg::SQRT;
+                  fpu_op      = fpnew_pkg::SQRT;
                   fp_op_group = DIVSQRT;
                   // rs2 and R must be zero
                   if ((instr_rdata_i[24:20] != 5'b00000) || instr_rdata_i[14]) begin
@@ -639,24 +833,16 @@ module cv32e40p_decoder
                 5'b01000: begin
                   regc_used_o = 1'b1;
                   regc_mux_o  = REGC_RD; // third operand is rd
-                  if (ZFINX == 0) begin
-                    reg_fp_c_o = 1'b1;
-                  end else begin
-                    reg_fp_c_o = 1'b0;
-                  end
-                  fpu_op      = cv32e40p_fpu_pkg::FMADD;
+                  reg_fp_c_o  = 1'b1;
+                  fpu_op      = fpnew_pkg::FMADD;
                   fp_op_group = ADDMUL;
                 end
                 // vfmre.vfmt - Vectorial FP Multiply-Reduce
                 5'b01001: begin
                   regc_used_o = 1'b1;
                   regc_mux_o  = REGC_RD; // third operand is rd
-                  if (ZFINX == 0) begin
-                    reg_fp_c_o = 1'b1;
-                  end else begin
-                    reg_fp_c_o = 1'b0;
-                  end
-                  fpu_op      = cv32e40p_fpu_pkg::FMADD;
+                  reg_fp_c_o  = 1'b1;
+                  fpu_op      = fpnew_pkg::FMADD;
                   fpu_op_mod  = 1'b1;
                   fp_op_group = ADDMUL;
                 end
@@ -669,25 +855,25 @@ module cv32e40p_decoder
                     // vfmv.{x.vfmt/vfmt.x} - Vectorial FP Reg <-> GP Reg Moves
                     5'b00000: begin
                       alu_op_b_mux_sel_o = OP_B_REGA_OR_FWD; // set rs2 = rs1 so we can map FMV to SGNJ in the unit
-                      fpu_op             = cv32e40p_fpu_pkg::SGNJ;
+                      fpu_op             = fpnew_pkg::SGNJ;
                       fp_rnd_mode_o      = 3'b011;  // passthrough without checking nan-box
                       fp_op_group        = NONCOMP;
                       check_fprm         = 1'b0;
                       // GP reg to FP reg
                       if (instr_rdata_i[14]) begin
-                        reg_fp_a_o       = 1'b0; // go from integer regfile
-                        fpu_op_mod       = 1'b0; // nan-box result
+                        reg_fp_a_o        = 1'b0; // go from integer regfile
+                        fpu_op_mod        = 1'b0; // nan-box result
                       end
                       // FP reg to GP reg
                       else begin
-                        reg_fp_d_o       = 1'b0; // go to integer regfile
-                        fpu_op_mod       = 1'b1; // sign-extend result
+                        reg_fp_d_o        = 1'b0; // go to integer regfile
+                        fpu_op_mod        = 1'b1; // sign-extend result
                       end
                     end
                     // vfclass.vfmt - Vectorial FP Classifications
                     5'b00001: begin
                       reg_fp_d_o    = 1'b0; // go to integer regfile
-                      fpu_op        = cv32e40p_fpu_pkg::CLASSIFY;
+                      fpu_op        = fpnew_pkg::CLASSIFY;
                       fp_rnd_mode_o = 3'b000;
                       fp_op_group   = NONCOMP;
                       check_fprm    = 1'b0;
@@ -701,45 +887,45 @@ module cv32e40p_decoder
                       // Integer width matches FP width
                       unique case (instr_rdata_i[13:12])
                         // FP32
-                        2'b00 : fpu_int_fmt_o = cv32e40p_fpu_pkg::INT32;
+                        2'b00 : fpu_int_fmt_o = fpnew_pkg::INT32;
                         // FP16[ALT]
                         2'b01,
-                        2'b10: fpu_int_fmt_o = cv32e40p_fpu_pkg::INT16;
+                        2'b10: fpu_int_fmt_o = fpnew_pkg::INT16;
                         // FP8
-                        2'b11: fpu_int_fmt_o = cv32e40p_fpu_pkg::INT8;
+                        2'b11: fpu_int_fmt_o = fpnew_pkg::INT8;
                       endcase
                       // Int to FP conversion
                       if (instr_rdata_i[20]) begin
                         reg_fp_a_o = 1'b0; // go from integer regfile
-                        fpu_op     = cv32e40p_fpu_pkg::I2F;
+                        fpu_op     = fpnew_pkg::I2F;
                       end
                       // FP to Int conversion
                       else begin
                         reg_fp_d_o = 1'b0; // go to integer regfile
-                        fpu_op     = cv32e40p_fpu_pkg::F2I;
+                        fpu_op     = fpnew_pkg::F2I;
                       end
                     end
                     // vfcvt.vfmt.vfmt - Vectorial FP <-> FP Conversions
                     5'b001??: begin
-                      fpu_op      = cv32e40p_fpu_pkg::F2F;
+                      fpu_op      = fpnew_pkg::F2F;
                       fp_op_group = CONV;
                       // check source format
                       unique case (instr_rdata_i[21:20])
                         // Only process instruction if corresponding extension is active (static)
                         2'b00: begin
-                          fpu_src_fmt_o = cv32e40p_fpu_pkg::FP32;
+                          fpu_src_fmt_o = fpnew_pkg::FP32;
                           if (~C_RVF) illegal_insn_o = 1'b1;
                         end
                         2'b01: begin
-                          fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                          fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                           if (~C_XF16ALT) illegal_insn_o = 1'b1;
                         end
                         2'b10: begin
-                          fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16;
+                          fpu_src_fmt_o = fpnew_pkg::FP16;
                           if (~C_XF16) illegal_insn_o = 1'b1;
                         end
                         2'b11: begin
-                          fpu_src_fmt_o = cv32e40p_fpu_pkg::FP8;
+                          fpu_src_fmt_o = fpnew_pkg::FP8;
                           if (~C_XF8) illegal_insn_o = 1'b1;
                         end
                       endcase
@@ -752,21 +938,21 @@ module cv32e40p_decoder
                 end
                 // vfsgnj.vfmt - Vectorial FP Sign Injection
                 5'b01101: begin
-                  fpu_op        = cv32e40p_fpu_pkg::SGNJ;
+                  fpu_op        = fpnew_pkg::SGNJ;
                   fp_rnd_mode_o = 3'b000; // sgnj
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0;
                 end
                 // vfsgnjn.vfmt - Vectorial FP Negated Sign Injection
                 5'b01110: begin
-                  fpu_op        = cv32e40p_fpu_pkg::SGNJ;
+                  fpu_op        = fpnew_pkg::SGNJ;
                   fp_rnd_mode_o = 3'b001; // sgnjn
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0;
                 end
                 // vfsgnjx.vfmt - Vectorial FP Xored Sign Injection
                 5'b01111: begin
-                  fpu_op        = cv32e40p_fpu_pkg::SGNJ;
+                  fpu_op        = fpnew_pkg::SGNJ;
                   fp_rnd_mode_o = 3'b010; // sgnjx
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0;
@@ -774,7 +960,7 @@ module cv32e40p_decoder
                 // vfeq.vfmt - Vectorial FP Equals
                 5'b10000: begin
                   reg_fp_d_o    = 1'b0; // go to integer regfile
-                  fpu_op        = cv32e40p_fpu_pkg::CMP;
+                  fpu_op        = fpnew_pkg::CMP;
                   fp_rnd_mode_o = 3'b010; // eq
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0;
@@ -782,7 +968,7 @@ module cv32e40p_decoder
                 // vfne.vfmt - Vectorial FP Not Equals
                 5'b10001: begin
                   reg_fp_d_o    = 1'b0; // go to integer regfile
-                  fpu_op        = cv32e40p_fpu_pkg::CMP;
+                  fpu_op        = fpnew_pkg::CMP;
                   fpu_op_mod    = 1'b1; // invert output
                   fp_rnd_mode_o = 3'b010; // eq
                   fp_op_group   = NONCOMP;
@@ -791,7 +977,7 @@ module cv32e40p_decoder
                 // vflt.vfmt - Vectorial FP Less Than
                 5'b10010: begin
                   reg_fp_d_o    = 1'b0; // go to integer regfile
-                  fpu_op        = cv32e40p_fpu_pkg::CMP;
+                  fpu_op        = fpnew_pkg::CMP;
                   fp_rnd_mode_o = 3'b001; // lt
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0;
@@ -799,7 +985,7 @@ module cv32e40p_decoder
                 // vfge.vfmt - Vectorial FP Greater Than or Equals
                 5'b10011: begin
                   reg_fp_d_o    = 1'b0; // go to integer regfile
-                  fpu_op        = cv32e40p_fpu_pkg::CMP;
+                  fpu_op        = fpnew_pkg::CMP;
                   fpu_op_mod    = 1'b1; // invert output
                   fp_rnd_mode_o = 3'b001; // lt
                   fp_op_group   = NONCOMP;
@@ -808,7 +994,7 @@ module cv32e40p_decoder
                 // vfle.vfmt - Vectorial FP Less Than or Equals
                 5'b10100: begin
                   reg_fp_d_o    = 1'b0; // go to integer regfile
-                  fpu_op        = cv32e40p_fpu_pkg::CMP;
+                  fpu_op        = fpnew_pkg::CMP;
                   fp_rnd_mode_o = 3'b000; // le
                   fp_op_group   = NONCOMP;
                   check_fprm    = 1'b0;
@@ -816,7 +1002,7 @@ module cv32e40p_decoder
                 // vfgt.vfmt - Vectorial FP Greater Than
                 5'b10101: begin
                   reg_fp_d_o    = 1'b0; // go to integer regfile
-                  fpu_op        = cv32e40p_fpu_pkg::CMP;
+                  fpu_op        = fpnew_pkg::CMP;
                   fpu_op_mod    = 1'b1; // invert output
                   fp_rnd_mode_o = 3'b000; // le
                   fp_op_group   = NONCOMP;
@@ -829,28 +1015,28 @@ module cv32e40p_decoder
                   fp_op_group          = CONV;
                   scalar_replication_o = 1'b0;
 
-                  if (instr_rdata_i[25]) fpu_op = cv32e40p_fpu_pkg::CPKCD; // vfcpk{c/d}
-                  else fpu_op = cv32e40p_fpu_pkg::CPKAB; // vfcpk{a/b}
+                  if (instr_rdata_i[25]) fpu_op = fpnew_pkg::CPKCD; // vfcpk{c/d}
+                  else fpu_op = fpnew_pkg::CPKAB; // vfcpk{a/b}
 
                   // vfcpk{a-d}.vfmt.d - from double
                   if (instr_rdata_i[26]) begin
-                    fpu_src_fmt_o  = cv32e40p_fpu_pkg::FP64;
+                    fpu_src_fmt_o  = fpnew_pkg::FP64;
                     if (~C_RVD) illegal_insn_o = 1'b1;
                   end
                   // vfcpk{a-d}.vfmt.s
                   else begin
-                    fpu_src_fmt_o  = cv32e40p_fpu_pkg::FP32;
+                    fpu_src_fmt_o  = fpnew_pkg::FP32;
                     if (~C_RVF) illegal_insn_o = 1'b1;
                   end
                   // Resolve legal vfcpk / format combinations (mostly static)
-                  if (fpu_op == cv32e40p_fpu_pkg::CPKCD) begin // vfcpk{c/d} not possible unless FP8 and FLEN>=64
+                  if (fpu_op == fpnew_pkg::CPKCD) begin // vfcpk{c/d} not possible unless FP8 and FLEN>=64
                     if (~C_XF8 || ~C_RVD) illegal_insn_o = 1'b1;
                   end else begin
                     if (instr_rdata_i[14]) begin // vfcpkb
                       // vfcpkb not possible for FP32
-                      if (fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP32) illegal_insn_o = 1'b1;
+                      if (fpu_dst_fmt_o == fpnew_pkg::FP32) illegal_insn_o = 1'b1;
                       // vfcpkb not possible for FP16[ALT] if not RVD
-                      if (~C_RVD && (fpu_dst_fmt_o != cv32e40p_fpu_pkg::FP8)) illegal_insn_o = 1'b1;
+                      if (~C_RVD && (fpu_dst_fmt_o != fpnew_pkg::FP8)) illegal_insn_o = 1'b1;
                     end
                   end
                 end
@@ -862,15 +1048,15 @@ module cv32e40p_decoder
 
               // check enabled formats (static)
               // need RVD for F vectors
-              if ((~C_RVF || ~C_RVD) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP32) illegal_insn_o = 1'b1;
+              if ((~C_RVF || ~C_RVD) && fpu_dst_fmt_o == fpnew_pkg::FP32) illegal_insn_o = 1'b1;
               // need RVF for F16 vectors
-              if ((~C_XF16 || ~C_RVF) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP16) illegal_insn_o = 1'b1;
+              if ((~C_XF16 || ~C_RVF) && fpu_dst_fmt_o == fpnew_pkg::FP16) illegal_insn_o = 1'b1;
               // need RVF for F16 vectors
-              if ((~C_XF16ALT || ~C_RVF) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP16ALT) begin
+              if ((~C_XF16ALT || ~C_RVF) && fpu_dst_fmt_o == fpnew_pkg::FP16ALT) begin
                 illegal_insn_o = 1'b1;
               end
               // need F16 for F8 vectors
-              if ((~C_XF8 || (~C_XF16 && ~C_XF16ALT)) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP8) begin
+              if ((~C_XF8 || (~C_XF16 && ~C_XF16ALT)) && fpu_dst_fmt_o == fpnew_pkg::FP8) begin
                 illegal_insn_o = 1'b1;
               end
 
@@ -889,34 +1075,35 @@ module cv32e40p_decoder
                 // ADDMUL has format dependent latency
                 ADDMUL : begin
                   unique case (fpu_dst_fmt_o)
-                    cv32e40p_fpu_pkg::FP32    : apu_lat_o = (FPU_ADDMUL_LAT<2)? FPU_ADDMUL_LAT+1: 2'h3;
-                    cv32e40p_fpu_pkg::FP16    : apu_lat_o = (C_LAT_FP16<2)    ? C_LAT_FP16+1    : 2'h3;
-                    cv32e40p_fpu_pkg::FP16ALT : apu_lat_o = (C_LAT_FP16ALT<2) ? C_LAT_FP16ALT+1 : 2'h3;
-                    cv32e40p_fpu_pkg::FP8     : apu_lat_o = (C_LAT_FP8<2)     ? C_LAT_FP8+1     : 2'h3;
+                    fpnew_pkg::FP32    : apu_lat_o = (C_LAT_FP32<2)    ? C_LAT_FP32+1    : 2'h3;
+                    fpnew_pkg::FP16    : apu_lat_o = (C_LAT_FP16<2)    ? C_LAT_FP16+1    : 2'h3;
+                    fpnew_pkg::FP16ALT : apu_lat_o = (C_LAT_FP16ALT<2) ? C_LAT_FP16ALT+1 : 2'h3;
+                    fpnew_pkg::FP8     : apu_lat_o = (C_LAT_FP8<2)     ? C_LAT_FP8+1     : 2'h3;
                     default : ;
                   endcase
                 end
                 // DIVSQRT is iterative and takes more than 2 cycles
                 DIVSQRT : apu_lat_o = 2'h3;
                 // NONCOMP uses the same latency for all formats
-                NONCOMP : apu_lat_o = (FPU_OTHERS_LAT<2) ? FPU_OTHERS_LAT+1 : 2'h3;
+                NONCOMP : apu_lat_o = (C_LAT_NONCOMP<2) ? C_LAT_NONCOMP+1 : 2'h3;
                 // CONV uses the same latency for all formats
-                CONV    : apu_lat_o = (FPU_OTHERS_LAT<2) ? FPU_OTHERS_LAT+1 : 2'h3;
+                CONV    : apu_lat_o = (C_LAT_CONV<2) ? C_LAT_CONV+1 : 2'h3;
               endcase
 
               // Set FPnew OP and OPMOD as the APU op
               apu_op_o = {fpu_vec_op, fpu_op_mod, fpu_op};
-
-            // no FPU or FPU and no Vectors
-            end else begin
+            end
+            // FPU!=1 or no Vectors or old shared unit
+            else begin
               illegal_insn_o = 1'b1;
             end
           end // Vectorial Float Ops
 
-        end  // PREFIX 10
+        end  // prefix 10
 
         // PREFIX 00/01
         else begin
+          // non bit-manipulation instructions
           regfile_alu_we = 1'b1;
           rega_used_o    = 1'b1;
 
@@ -944,26 +1131,26 @@ module cv32e40p_decoder
             end
             {6'b00_0001, 3'b001}: begin // mulh
               alu_en             = 1'b0;
-              mult_int_en        = 1'b1;
               regc_used_o        = 1'b1;
               regc_mux_o         = REGC_ZERO;
               mult_signed_mode_o = 2'b11;
+              mult_int_en        = 1'b1;
               mult_operator_o    = MUL_H;
             end
             {6'b00_0001, 3'b010}: begin // mulhsu
               alu_en             = 1'b0;
-              mult_int_en        = 1'b1;
               regc_used_o        = 1'b1;
               regc_mux_o         = REGC_ZERO;
               mult_signed_mode_o = 2'b01;
+              mult_int_en        = 1'b1;
               mult_operator_o    = MUL_H;
             end
             {6'b00_0001, 3'b011}: begin // mulhu
               alu_en             = 1'b0;
-              mult_int_en        = 1'b1;
               regc_used_o        = 1'b1;
               regc_mux_o         = REGC_ZERO;
               mult_signed_mode_o = 2'b00;
+              mult_int_en        = 1'b1;
               mult_operator_o    = MUL_H;
             end
             {6'b00_0001, 3'b100}: begin // div
@@ -991,6 +1178,210 @@ module cv32e40p_decoder
               alu_operator_o     = ALU_REMU;
             end
 
+            // PULP specific instructions
+            {6'b10_0001, 3'b000}: begin         // p.mac
+              if (PULP_XPULP) begin
+                alu_en          = 1'b0;
+                regc_used_o     = 1'b1;
+                regc_mux_o      = REGC_RD;
+                mult_int_en     = 1'b1;
+                mult_operator_o = MUL_MAC32;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b10_0001, 3'b001}: begin         // p.msu
+              if (PULP_XPULP) begin
+                alu_en          = 1'b0;
+                regc_used_o     = 1'b1;
+                regc_mux_o      = REGC_RD;
+                mult_int_en     = 1'b1;
+                mult_operator_o = MUL_MSU32;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0010, 3'b010}: begin         // Set Lower Equal Than - p.slet
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_SLETS;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0010, 3'b011}: begin         // Set Lower Equal Than Unsigned; p.sletu
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_SLETU;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0010, 3'b100}: begin         // Min - p.min
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_MIN;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0010, 3'b101}: begin         // Min Unsigned - p.minu
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_MINU;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0010, 3'b110}: begin         // Max - p.max
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_MAX;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0010, 3'b111}: begin         // Max Unsigned - p.maxu
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_MAXU;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0100, 3'b101}: begin         // Rotate Right - p.ror
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_ROR;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
+            // PULP specific instructions using only one source register
+
+            {6'b00_1000, 3'b000}: begin         // Find First 1 - p.ff1
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_FF1;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1000, 3'b001}: begin         // Find Last 1 - p.fl1
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_FL1;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1000, 3'b010}: begin         // Count Leading Bits - p.clb
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_CLB;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1000, 3'b011}: begin         // Count set bits (popcount) - p.cnt
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_CNT;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1000, 3'b100}: begin         // Sign-extend Halfword - p.exths
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_EXTS;
+                alu_vec_mode_o = VEC_MODE16;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1000, 3'b101}: begin         // Zero-extend Halfword - p.exthz
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_EXT;
+                alu_vec_mode_o = VEC_MODE16;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1000, 3'b110}: begin         // Sign-extend Byte - p.extbs
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_EXTS;
+                alu_vec_mode_o = VEC_MODE8;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1000, 3'b111}: begin         // Zero-extend Byte - p.extbz
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_EXT;
+                alu_vec_mode_o = VEC_MODE8;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_0010, 3'b000}: begin         // p.abs
+              if (PULP_XPULP) begin
+                alu_operator_o = ALU_ABS;
+                if (instr_rdata_i[24:20] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1010, 3'b001}: begin         // p.clip
+              if (PULP_XPULP) begin
+                alu_operator_o     = ALU_CLIP;
+                alu_op_b_mux_sel_o = OP_B_IMM;
+                imm_b_mux_sel_o    = IMMB_CLIP;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1010, 3'b010}: begin         // p.clipu
+              if (PULP_XPULP) begin
+                alu_operator_o     = ALU_CLIPU;
+                alu_op_b_mux_sel_o = OP_B_IMM;
+                imm_b_mux_sel_o    = IMMB_CLIP;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1010, 3'b101}: begin         // p.clipr
+              if (PULP_XPULP) begin
+                alu_operator_o     = ALU_CLIP;
+                regb_used_o        = 1'b1;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            {6'b00_1010, 3'b110}: begin         // p.clipur
+              if (PULP_XPULP) begin
+                alu_operator_o     = ALU_CLIPU;
+                regb_used_o        = 1'b1;
+              end else begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
             default: begin
               illegal_insn_o = 1'b1;
             end
@@ -1008,25 +1399,19 @@ module cv32e40p_decoder
       //                        //
       ////////////////////////////
 
-      // Floating Point arithmetic
+      // floating point arithmetic
       OPCODE_OP_FP: begin
-        if (FPU == 1 && (ZFINX == 1 || fs_off_i == 1'b0)) begin
+        if (FPU==1) begin
 
           // using APU instead of ALU
-          alu_en           = 1'b0;
           apu_en           = 1'b1;
+          alu_en           = 1'b0;
           // by default, set all registers to FP registers and use 2
           rega_used_o      = 1'b1;
           regb_used_o      = 1'b1;
-          if (ZFINX == 0) begin
-            reg_fp_a_o     = 1'b1;
-            reg_fp_b_o     = 1'b1;
-            reg_fp_d_o     = 1'b1;
-          end else begin
-            reg_fp_a_o     = 1'b0;
-            reg_fp_b_o     = 1'b0;
-            reg_fp_d_o     = 1'b0;
-          end
+          reg_fp_a_o       = 1'b1;
+          reg_fp_b_o       = 1'b1;
+          reg_fp_d_o       = 1'b1;
           // by default we need to verify rm is legal but assume it is for now
           check_fprm       = 1'b1;
           fp_rnd_mode_o    = instr_rdata_i[14:12];
@@ -1034,18 +1419,18 @@ module cv32e40p_decoder
           // Decode Formats (preliminary, can change for some ops)
           unique case (instr_rdata_i[26:25])
             // FP32
-            2'b00: fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP32;
+            2'b00: fpu_dst_fmt_o = fpnew_pkg::FP32;
             // FP64
-            2'b01: fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP64;
+            2'b01: fpu_dst_fmt_o = fpnew_pkg::FP64;
             // FP16 or FP16ALT
             2'b10: begin
               // FP16alt encoded in rm field
-              if (instr_rdata_i[14:12] == 3'b101) fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+              if (instr_rdata_i[14:12]==3'b101) fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
               // this can still change to FP16ALT
-              else fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16;
+              else fpu_dst_fmt_o = fpnew_pkg::FP16;
             end
             // FP8
-            2'b11: fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP8;
+            2'b11: fpu_dst_fmt_o = fpnew_pkg::FP8;
           endcase
 
           // By default, src=dst
@@ -1055,40 +1440,48 @@ module cv32e40p_decoder
           unique case (instr_rdata_i[31:27])
             // fadd.fmt - FP Addition
             5'b00000: begin
-              fpu_op             = cv32e40p_fpu_pkg::ADD;
-              fp_op_group        = ADDMUL;
+              fpu_op        = fpnew_pkg::ADD;
+              fp_op_group   = ADDMUL;
+              apu_op_o      = 2'b0;
+              apu_lat_o     = (PIPE_REG_ADDSUB==1) ? 2'h2 : 2'h1;
               alu_op_b_mux_sel_o = OP_B_REGA_OR_FWD;
               alu_op_c_mux_sel_o = OP_C_REGB_OR_FWD;
             end
             // fsub.fmt - FP Subtraction
             5'b00001: begin
-              fpu_op             = cv32e40p_fpu_pkg::ADD;
-              fpu_op_mod         = 1'b1;
-              fp_op_group        = ADDMUL;
+              fpu_op        = fpnew_pkg::ADD;
+              fpu_op_mod    = 1'b1;
+              fp_op_group   = ADDMUL;
+              apu_op_o      = 2'b1;
+              apu_lat_o     = (PIPE_REG_ADDSUB==1) ? 2'h2 : 2'h1;
               alu_op_b_mux_sel_o = OP_B_REGA_OR_FWD;
               alu_op_c_mux_sel_o = OP_C_REGB_OR_FWD;
             end
             // fmul.fmt - FP Multiplication
             5'b00010: begin
-              fpu_op      = cv32e40p_fpu_pkg::MUL;
-              fp_op_group = ADDMUL;
+              fpu_op        = fpnew_pkg::MUL;
+              fp_op_group   = ADDMUL;
+              apu_lat_o     = (PIPE_REG_MULT==1) ? 2'h2 : 2'h1;
             end
             // fdiv.fmt - FP Division
             5'b00011: begin
-              fpu_op      = cv32e40p_fpu_pkg::DIV;
+              fpu_op      = fpnew_pkg::DIV;
               fp_op_group = DIVSQRT;
+              apu_lat_o   = 2'h3;
             end
             // fsqrt.fmt - FP Square Root
             5'b01011: begin
               regb_used_o = 1'b0;
-              fpu_op      = cv32e40p_fpu_pkg::SQRT;
+              fpu_op      = fpnew_pkg::SQRT;
               fp_op_group = DIVSQRT;
+              apu_op_o    = 1'b1;
+              apu_lat_o   = 2'h3;
               // rs2 must be zero
               if (instr_rdata_i[24:20] != 5'b00000) illegal_insn_o = 1'b1;
             end
             // fsgn{j[n]/jx}.fmt - FP Sign Injection
             5'b00100: begin
-              fpu_op        = cv32e40p_fpu_pkg::SGNJ;
+              fpu_op        = fpnew_pkg::SGNJ;
               fp_op_group   = NONCOMP;
               check_fprm    = 1'b0; // instruction encoded in rm, do the check here
               if (C_XF16ALT) begin  // FP16ALT instructions encoded in rm separately (static)
@@ -1097,8 +1490,8 @@ module cv32e40p_decoder
                 end
                 // FP16ALT uses special encoding here
                 if (instr_rdata_i[14]) begin
-                  fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
+                  fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                 end else begin
                   fp_rnd_mode_o = {1'b0, instr_rdata_i[13:12]};
                 end
@@ -1108,7 +1501,7 @@ module cv32e40p_decoder
             end
             // fmin/fmax.fmt - FP Minimum / Maximum
             5'b00101: begin
-              fpu_op        = cv32e40p_fpu_pkg::MINMAX;
+              fpu_op        = fpnew_pkg::MINMAX;
               fp_op_group   = NONCOMP;
               check_fprm    = 1'b0; // instruction encoded in rm, do the check here
               if (C_XF16ALT) begin  // FP16ALT instructions encoded in rm separately (static)
@@ -1117,8 +1510,8 @@ module cv32e40p_decoder
                 end
                 // FP16ALT uses special encoding here
                 if (instr_rdata_i[14]) begin
-                  fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
+                  fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                 end else begin
                   fp_rnd_mode_o = {1'b0, instr_rdata_i[13:12]};
                 end
@@ -1129,7 +1522,7 @@ module cv32e40p_decoder
             // fcvt.fmt.fmt - FP to FP Conversion
             5'b01000: begin
               regb_used_o   = 1'b0;
-              fpu_op        = cv32e40p_fpu_pkg::F2F;
+              fpu_op        = fpnew_pkg::F2F;
               fp_op_group   = CONV;
               // bits [22:20] used, other bits must be 0
               if (instr_rdata_i[24:23]) illegal_insn_o = 1'b1;
@@ -1137,54 +1530,50 @@ module cv32e40p_decoder
               unique case (instr_rdata_i[22:20])
                 // Only process instruction if corresponding extension is active (static)
                 3'b000: begin
-                  if (!(C_RVF && (C_XF16 || C_XF16ALT || C_XF8))) illegal_insn_o = 1'b1;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP32;
+                  if (~C_RVF) illegal_insn_o = 1'b1;
+                  fpu_src_fmt_o = fpnew_pkg::FP32;
                 end
                 3'b001: begin
                   if (~C_RVD) illegal_insn_o = 1'b1;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP64;
+                  fpu_src_fmt_o = fpnew_pkg::FP64;
                 end
                 3'b010: begin
                   if (~C_XF16) illegal_insn_o = 1'b1;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16;
+                  fpu_src_fmt_o = fpnew_pkg::FP16;
                 end
                 3'b110: begin
                   if (~C_XF16ALT) illegal_insn_o = 1'b1;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                 end
                 3'b011: begin
                   if (~C_XF8) illegal_insn_o = 1'b1;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP8;
+                  fpu_src_fmt_o = fpnew_pkg::FP8;
                 end
                 default: illegal_insn_o = 1'b1;
               endcase
             end
             // fmulex.s.fmt - FP Expanding Multiplication to FP32
             5'b01001: begin
-              if (~C_XF16 && ~C_XF16ALT && ~C_XF8) illegal_insn_o = 1;
-              fpu_op        = cv32e40p_fpu_pkg::MUL;
+              fpu_op        = fpnew_pkg::MUL;
               fp_op_group   = ADDMUL;
+              apu_lat_o     = (PIPE_REG_MULT==1) ? 2'h2 : 2'h1;
               // set dst format to FP32
-              fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP32;
+              fpu_dst_fmt_o = fpnew_pkg::FP32;
             end
             // fmacex.s.fmt - FP Expanding Multipy-Accumulate to FP32
             5'b01010: begin
-              if (~C_XF16 && ~C_XF16ALT && ~C_XF8) illegal_insn_o = 1;
               regc_used_o = 1'b1;
               regc_mux_o  = REGC_RD; // third operand is rd
-              if (ZFINX == 0) begin
-                reg_fp_c_o = 1'b1;
-              end else begin
-                reg_fp_c_o = 1'b0;
-              end
-              fpu_op      = cv32e40p_fpu_pkg::FMADD;
+              reg_fp_c_o  = 1'b1;
+              fpu_op      = fpnew_pkg::FMADD;
               fp_op_group = ADDMUL;
+              apu_lat_o   = (PIPE_REG_MULT==1) ? 2'h2 : 2'h1;
               // set dst format to FP32
-              fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP32;
+              fpu_dst_fmt_o = fpnew_pkg::FP32;
             end
             // feq/flt/fle.fmt - FP Comparisons
             5'b10100: begin
-              fpu_op        = cv32e40p_fpu_pkg::CMP;
+              fpu_op        = fpnew_pkg::CMP;
               fp_op_group   = NONCOMP;
               reg_fp_d_o    = 1'b0; // go to integer regfile
               check_fprm    = 1'b0; // instruction encoded in rm, do the check here
@@ -1194,8 +1583,8 @@ module cv32e40p_decoder
                 end
                 // FP16ALT uses special encoding here
                 if (instr_rdata_i[14]) begin
-                  fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
+                  fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                 end else begin
                   fp_rnd_mode_o = {1'b0, instr_rdata_i[13:12]};
                 end
@@ -1205,34 +1594,36 @@ module cv32e40p_decoder
             end
             // fcvt.ifmt.fmt - FP to Int Conversion
             5'b11000: begin
-              regb_used_o = 1'b0;
-              reg_fp_d_o  = 1'b0; // go to integer regfile
-              fpu_op      = cv32e40p_fpu_pkg::F2I;
-              fp_op_group = CONV;
-              fpu_op_mod  = instr_rdata_i[20]; // signed/unsigned switch
+              regb_used_o   = 1'b0;
+              reg_fp_d_o    = 1'b0; // go to integer regfile
+              fpu_op        = fpnew_pkg::F2I;
+              fp_op_group   = CONV;
+              fpu_op_mod    = instr_rdata_i[20]; // signed/unsigned switch
+              apu_op_o      = 2'b1;
+              apu_lat_o     = (PIPE_REG_CAST==1) ? 2'h2 : 2'h1;
 
               unique case (instr_rdata_i[26:25]) //fix for casting to different formats other than FP32
                 2'b00: begin
                   if (~C_RVF) illegal_insn_o = 1;
-                  else fpu_src_fmt_o = cv32e40p_fpu_pkg::FP32;
+                  else fpu_src_fmt_o = fpnew_pkg::FP32;
                 end
                 2'b01: begin
                   if (~C_RVD) illegal_insn_o = 1;
-                  else fpu_src_fmt_o = cv32e40p_fpu_pkg::FP64;
+                  else fpu_src_fmt_o = fpnew_pkg::FP64;
                 end
                 2'b10: begin
                   if (instr_rdata_i[14:12] == 3'b101) begin
                     if (~C_XF16ALT) illegal_insn_o = 1;
-                    else fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                    else fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                   end else if (~C_XF16) begin
                     illegal_insn_o = 1;
                   end else begin
-                    fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16;
+                    fpu_src_fmt_o = fpnew_pkg::FP16;
                   end
                 end
                 2'b11: begin
                   if (~C_XF8) illegal_insn_o = 1;
-                  else fpu_src_fmt_o = cv32e40p_fpu_pkg::FP8;
+                  else fpu_src_fmt_o = fpnew_pkg::FP8;
                 end
               endcase // unique case (instr_rdata_i[26:25])
               // bits [21:20] used, other bits must be 0
@@ -1240,11 +1631,13 @@ module cv32e40p_decoder
             end
             // fcvt.fmt.ifmt - Int to FP Conversion
             5'b11010: begin
-              regb_used_o = 1'b0;
-              reg_fp_a_o  = 1'b0; // go from integer regfile
-              fpu_op      = cv32e40p_fpu_pkg::I2F;
-              fp_op_group = CONV;
-              fpu_op_mod  = instr_rdata_i[20]; // signed/unsigned switch
+              regb_used_o   = 1'b0;
+              reg_fp_a_o    = 1'b0; // go from integer regfile
+              fpu_op        = fpnew_pkg::I2F;
+              fp_op_group   = CONV;
+              fpu_op_mod    = instr_rdata_i[20]; // signed/unsigned switch
+              apu_op_o      = 2'b0;
+              apu_lat_o     = (PIPE_REG_CAST==1) ? 2'h2 : 2'h1;
               // bits [21:20] used, other bits must be 0
               if (instr_rdata_i[24:21]) illegal_insn_o = 1'b1;   // in RV32, no casts to L allowed.
             end
@@ -1255,24 +1648,24 @@ module cv32e40p_decoder
               fp_op_group = NONCOMP;
               check_fprm  = 1'b0; // instruction encoded in rm, do the check here
               // fmv.x.fmt - FPR to GPR Move
-              if ((ZFINX == 0 && instr_rdata_i[14:12] == 3'b000) || (C_XF16ALT && instr_rdata_i[14:12] == 3'b100)) begin
+              if (instr_rdata_i[14:12] == 3'b000 || (C_XF16ALT && instr_rdata_i[14:12] == 3'b100)) begin
                 alu_op_b_mux_sel_o  = OP_B_REGA_OR_FWD; // set rs2 = rs1 so we can map FMV to SGNJ in the unit
-                fpu_op              = cv32e40p_fpu_pkg::SGNJ; // mapped to SGNJ-passthrough since no recoding
+                fpu_op              = fpnew_pkg::SGNJ; // mapped to SGNJ-passthrough since no recoding
                 fpu_op_mod          = 1'b1;    // sign-extend result
                 fp_rnd_mode_o       = 3'b011;  // passthrough without checking nan-box
                 // FP16ALT uses special encoding here
                 if (instr_rdata_i[14]) begin
-                  fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
+                  fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                 end
               // fclass.fmt - FP Classify
               end else if (instr_rdata_i[14:12] == 3'b001 || (C_XF16ALT && instr_rdata_i[14:12] == 3'b101)) begin
-                fpu_op        = cv32e40p_fpu_pkg::CLASSIFY;
+                fpu_op        = fpnew_pkg::CLASSIFY;
                 fp_rnd_mode_o = 3'b000;
                 // FP16ALT uses special encoding here
                 if (instr_rdata_i[14]) begin
-                  fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
+                  fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                 end
               end else begin
                 illegal_insn_o = 1'b1;
@@ -1285,16 +1678,16 @@ module cv32e40p_decoder
               regb_used_o         = 1'b0;
               reg_fp_a_o          = 1'b0; // go from integer regfile
               alu_op_b_mux_sel_o  = OP_B_REGA_OR_FWD; // set rs2 = rs1 so we can map FMV to SGNJ in the unit
-              fpu_op              = cv32e40p_fpu_pkg::SGNJ; // mapped to SGNJ-passthrough since no recoding
+              fpu_op              = fpnew_pkg::SGNJ; // mapped to SGNJ-passthrough since no recoding
               fpu_op_mod          = 1'b0;    // nan-box result
               fp_op_group         = NONCOMP;
               fp_rnd_mode_o       = 3'b011;  // passthrough without checking nan-box
               check_fprm          = 1'b0; // instruction encoded in rm, do the check here
-              if ((ZFINX == 0 && instr_rdata_i[14:12] == 3'b000) || (C_XF16ALT && instr_rdata_i[14:12] == 3'b100)) begin
+              if (instr_rdata_i[14:12] == 3'b000 || (C_XF16ALT && instr_rdata_i[14:12] == 3'b100)) begin
                 // FP16ALT uses special encoding here
                 if (instr_rdata_i[14]) begin
-                  fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
-                  fpu_src_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
+                  fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
+                  fpu_src_fmt_o = fpnew_pkg::FP16ALT;
                 end
               end else begin
                 illegal_insn_o = 1'b1;
@@ -1303,35 +1696,37 @@ module cv32e40p_decoder
               if (instr_rdata_i[24:20] != 5'b00000) illegal_insn_o = 1'b1;
             end
             // Rest are illegal instructions
-            default: illegal_insn_o = 1'b1;
+            default: begin
+              illegal_insn_o = 1'b1;
+            end
           endcase
 
           // check enabled formats (static)
-          if (~C_RVF && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP32) illegal_insn_o = 1'b1;
-          if ((~C_RVD) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP64) illegal_insn_o = 1'b1;
-          if ((~C_XF16) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP16) illegal_insn_o = 1'b1;
-          if ((~C_XF16ALT) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP16ALT) begin
+          if (~C_RVF && fpu_dst_fmt_o == fpnew_pkg::FP32) illegal_insn_o = 1'b1;
+          if ((~C_RVD) && fpu_dst_fmt_o == fpnew_pkg::FP64) illegal_insn_o = 1'b1;
+          if ((~C_XF16) && fpu_dst_fmt_o == fpnew_pkg::FP16) illegal_insn_o = 1'b1;
+          if ((~C_XF16ALT) && fpu_dst_fmt_o == fpnew_pkg::FP16ALT) begin
             illegal_insn_o = 1'b1;
           end
-          if ((~C_XF8) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP8) illegal_insn_o = 1'b1;
+          if ((~C_XF8) && fpu_dst_fmt_o == fpnew_pkg::FP8) illegal_insn_o = 1'b1;
 
           // check rounding mode
           if (check_fprm) begin
             unique case (instr_rdata_i[14:12]) inside
-              3'b000, 3'b001, 3'b010, 3'b011, 3'b100: ; //legal rounding modes
+              [3'b000:3'b100]: ; //legal rounding modes
               3'b101: begin      // Alternative Half-Precsision encded as fmt=10 and rm=101
-                if (~C_XF16ALT || fpu_dst_fmt_o != cv32e40p_fpu_pkg::FP16ALT) illegal_insn_o = 1'b1;
+                if (~C_XF16ALT || fpu_dst_fmt_o != fpnew_pkg::FP16ALT) illegal_insn_o = 1'b1;
                 // actual rounding mode from frm csr
                 unique case (frm_i) inside
-                  3'b000, 3'b001, 3'b010, 3'b011, 3'b100 : fp_rnd_mode_o = frm_i; //legal rounding modes
-                  default                                : illegal_insn_o = 1'b1;
+                  [3'b000:3'b100] : fp_rnd_mode_o = frm_i; //legal rounding modes
+                  default         : illegal_insn_o = 1'b1;
                 endcase
               end
               3'b111: begin
                 // rounding mode from frm csr
                 unique case (frm_i) inside
-                  3'b000, 3'b001, 3'b010, 3'b011, 3'b100 : fp_rnd_mode_o = frm_i; //legal rounding modes
-                  default                                : illegal_insn_o = 1'b1;
+                  [3'b000:3'b100] : fp_rnd_mode_o = frm_i; //legal rounding modes
+                  default         : illegal_insn_o = 1'b1;
                 endcase
               end
               default : illegal_insn_o = 1'b1;
@@ -1345,73 +1740,66 @@ module cv32e40p_decoder
             // ADDMUL has format dependent latency
             ADDMUL : begin
               unique case (fpu_dst_fmt_o)
-                cv32e40p_fpu_pkg::FP32    : apu_lat_o = (FPU_ADDMUL_LAT<2)? FPU_ADDMUL_LAT+1: 2'h3;
-                cv32e40p_fpu_pkg::FP64    : apu_lat_o = (C_LAT_FP64<2)    ? C_LAT_FP64+1    : 2'h3;
-                cv32e40p_fpu_pkg::FP16    : apu_lat_o = (C_LAT_FP16<2)    ? C_LAT_FP16+1    : 2'h3;
-                cv32e40p_fpu_pkg::FP16ALT : apu_lat_o = (C_LAT_FP16ALT<2) ? C_LAT_FP16ALT+1 : 2'h3;
-                cv32e40p_fpu_pkg::FP8     : apu_lat_o = (C_LAT_FP8<2)     ? C_LAT_FP8+1     : 2'h3;
+                fpnew_pkg::FP32    : apu_lat_o = (C_LAT_FP32<2)    ? C_LAT_FP32+1    : 2'h3;
+                fpnew_pkg::FP64    : apu_lat_o = (C_LAT_FP64<2)    ? C_LAT_FP64+1    : 2'h3;
+                fpnew_pkg::FP16    : apu_lat_o = (C_LAT_FP16<2)    ? C_LAT_FP16+1    : 2'h3;
+                fpnew_pkg::FP16ALT : apu_lat_o = (C_LAT_FP16ALT<2) ? C_LAT_FP16ALT+1 : 2'h3;
+                fpnew_pkg::FP8     : apu_lat_o = (C_LAT_FP8<2)     ? C_LAT_FP8+1     : 2'h3;
                 default : ;
               endcase
             end
             // DIVSQRT is iterative and takes more than 2 cycles
             DIVSQRT : apu_lat_o = 2'h3;
             // NONCOMP uses the same latency for all formats
-            NONCOMP : apu_lat_o = (FPU_OTHERS_LAT<2) ? FPU_OTHERS_LAT+1 : 2'h3;
+            NONCOMP : apu_lat_o = (C_LAT_NONCOMP<2) ? C_LAT_NONCOMP+1 : 2'h3;
             // CONV uses the same latency for all formats
-            CONV    : apu_lat_o = (FPU_OTHERS_LAT<2) ? FPU_OTHERS_LAT+1 : 2'h3;
-            default: ;
+            CONV    : apu_lat_o = (C_LAT_CONV<2) ? C_LAT_CONV+1 : 2'h3;
           endcase
 
           // Set FPnew OP and OPMOD as the APU op
           apu_op_o = {fpu_vec_op, fpu_op_mod, fpu_op};
 
-        // No FPU or (ZFINX == 0 && MSTATUS.FS == FS_OFF)
-        end else begin
-          illegal_insn_o = 1'b1;
         end
+        // FPU!=1
+        else
+          illegal_insn_o = 1'b1;
       end
 
-      // Floating Point fused arithmetic
+      // floating point fused arithmetic
       OPCODE_OP_FMADD,
       OPCODE_OP_FMSUB,
       OPCODE_OP_FNMSUB,
       OPCODE_OP_FNMADD : begin
-        if (FPU == 1 && (ZFINX == 1 || fs_off_i == 1'b0)) begin
+        if (FPU==1) begin
           // using APU instead of ALU
-          alu_en        = 1'b0;
-          apu_en        = 1'b1;
+          apu_en           = 1'b1;
+          alu_en           = 1'b0;
+          apu_lat_o        = (PIPE_REG_MAC>1) ? 2'h3 : 2'h2;
           // all registers are FP registers and use three
-          rega_used_o   = 1'b1;
-          regb_used_o   = 1'b1;
-          regc_used_o   = 1'b1;
-          regc_mux_o    = REGC_S4;
-          if (ZFINX == 0) begin
-            reg_fp_a_o  = 1'b1;
-            reg_fp_b_o  = 1'b1;
-            reg_fp_c_o  = 1'b1;
-            reg_fp_d_o  = 1'b1;
-          end else begin
-            reg_fp_a_o  = 1'b0;
-            reg_fp_b_o  = 1'b0;
-            reg_fp_c_o  = 1'b0;
-            reg_fp_d_o  = 1'b0;
-          end
-          fp_rnd_mode_o = instr_rdata_i[14:12];
+          rega_used_o      = 1'b1;
+          regb_used_o      = 1'b1;
+          regc_used_o      = 1'b1;
+          regc_mux_o       = REGC_S4;
+          reg_fp_a_o       = 1'b1;
+          reg_fp_b_o       = 1'b1;
+          reg_fp_c_o       = 1'b1;
+          reg_fp_d_o       = 1'b1;
+          fp_rnd_mode_o    = instr_rdata_i[14:12];
 
           // Decode Formats
           unique case (instr_rdata_i[26:25])
             // FP32
-            2'b00 : fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP32;
+            2'b00 : fpu_dst_fmt_o = fpnew_pkg::FP32;
             // FP64
-            2'b01 : fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP64;
+            2'b01 : fpu_dst_fmt_o = fpnew_pkg::FP64;
             // FP16 or FP16ALT
             2'b10 : begin
               // FP16alt encoded in rm field
-              if (instr_rdata_i[14:12] == 3'b101) fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16ALT;
-              else fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP16;
+              if (instr_rdata_i[14:12]==3'b101) fpu_dst_fmt_o = fpnew_pkg::FP16ALT;
+              else fpu_dst_fmt_o = fpnew_pkg::FP16;
             end
             // FP8
-            2'b11 : fpu_dst_fmt_o = cv32e40p_fpu_pkg::FP8;
+            2'b11 : fpu_dst_fmt_o = fpnew_pkg::FP8;
           endcase
 
           // By default, src=dst
@@ -1421,49 +1809,52 @@ module cv32e40p_decoder
           unique case (instr_rdata_i[6:0])
             // fmadd.fmt - FP Fused multiply-add
             OPCODE_OP_FMADD : begin
-              fpu_op     = cv32e40p_fpu_pkg::FMADD;
+              fpu_op      = fpnew_pkg::FMADD;
+              apu_op_o    = 2'b00;
             end
             // fmsub.fmt - FP Fused multiply-subtract
             OPCODE_OP_FMSUB : begin
-              fpu_op     = cv32e40p_fpu_pkg::FMADD;
-              fpu_op_mod = 1'b1;
+              fpu_op      = fpnew_pkg::FMADD;
+              fpu_op_mod  = 1'b1;
+              apu_op_o    = 2'b01;
             end
             // fnmsub.fmt - FP Negated fused multiply-subtract
             OPCODE_OP_FNMSUB : begin
-              fpu_op     = cv32e40p_fpu_pkg::FNMSUB;
+              fpu_op      = fpnew_pkg::FNMSUB;
+              apu_op_o    = 2'b10;
             end
             // fnmadd.fmt - FP Negated fused multiply-add
             OPCODE_OP_FNMADD : begin
-              fpu_op     = cv32e40p_fpu_pkg::FNMSUB;
-              fpu_op_mod = 1'b1;
+              fpu_op      = fpnew_pkg::FNMSUB;
+              fpu_op_mod  = 1'b1;
+              apu_op_o    = 2'b11;
             end
-            default : ;
           endcase
 
           // check enabled formats (static)
-          if (~C_RVF && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP32) illegal_insn_o = 1'b1;
-          if ((~C_RVD) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP64) illegal_insn_o = 1'b1;
-          if ((~C_XF16) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP16) illegal_insn_o = 1'b1;
-          if ((~C_XF16ALT) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP16ALT) begin
+          if (~C_RVF && fpu_dst_fmt_o == fpnew_pkg::FP32) illegal_insn_o = 1'b1;
+          if ((~C_RVD) && fpu_dst_fmt_o == fpnew_pkg::FP64) illegal_insn_o = 1'b1;
+          if ((~C_XF16) && fpu_dst_fmt_o == fpnew_pkg::FP16) illegal_insn_o = 1'b1;
+          if ((~C_XF16ALT) && fpu_dst_fmt_o == fpnew_pkg::FP16ALT) begin
             illegal_insn_o = 1'b1;
           end
-          if ((~C_XF8) && fpu_dst_fmt_o == cv32e40p_fpu_pkg::FP8) illegal_insn_o = 1'b1;
+          if ((~C_XF8) && fpu_dst_fmt_o == fpnew_pkg::FP8) illegal_insn_o = 1'b1;
 
           // check rounding mode
           unique case (instr_rdata_i[14:12]) inside
-            3'b000, 3'b001, 3'b010, 3'b011, 3'b100: ; //legal rounding modes
+            [3'b000:3'b100]: ; //legal rounding modes
             3'b101: begin      // Alternative Half-Precsision encded as fmt=10 and rm=101
-              if (~C_XF16ALT || fpu_dst_fmt_o != cv32e40p_fpu_pkg::FP16ALT) illegal_insn_o = 1'b1;
+              if (~C_XF16ALT || fpu_dst_fmt_o != fpnew_pkg::FP16ALT) illegal_insn_o = 1'b1;
               // actual rounding mode from frm csr
               unique case (frm_i) inside
-                3'b000, 3'b001, 3'b010, 3'b011, 3'b100 : fp_rnd_mode_o = frm_i; //legal rounding modes
+                [3'b000:3'b100] : fp_rnd_mode_o = frm_i; //legal rounding modes
                 default         : illegal_insn_o = 1'b1;
               endcase
             end
             3'b111: begin
               // rounding mode from frm csr
               unique case (frm_i) inside
-                3'b000, 3'b001, 3'b010, 3'b011, 3'b100 : fp_rnd_mode_o = frm_i; //legal rounding modes
+                [3'b000:3'b100] : fp_rnd_mode_o = frm_i; //legal rounding modes
                 default         : illegal_insn_o = 1'b1;
               endcase
             end
@@ -1475,25 +1866,25 @@ module cv32e40p_decoder
           // 1 = single cycle (no latency), 2 = one pipestage, 3 = two or more pipestages
           // format dependent latency
           unique case (fpu_dst_fmt_o)
-            cv32e40p_fpu_pkg::FP32    : apu_lat_o = (FPU_ADDMUL_LAT<2)? FPU_ADDMUL_LAT+1: 2'h3;
-            cv32e40p_fpu_pkg::FP64    : apu_lat_o = (C_LAT_FP64<2)    ? C_LAT_FP64+1    : 2'h3;
-            cv32e40p_fpu_pkg::FP16    : apu_lat_o = (C_LAT_FP16<2)    ? C_LAT_FP16+1    : 2'h3;
-            cv32e40p_fpu_pkg::FP16ALT : apu_lat_o = (C_LAT_FP16ALT<2) ? C_LAT_FP16ALT+1 : 2'h3;
-            cv32e40p_fpu_pkg::FP8     : apu_lat_o = (C_LAT_FP8<2)     ? C_LAT_FP8+1     : 2'h3;
+            fpnew_pkg::FP32    : apu_lat_o = (C_LAT_FP32<2)    ? C_LAT_FP32+1    : 2'h3;
+            fpnew_pkg::FP64    : apu_lat_o = (C_LAT_FP64<2)    ? C_LAT_FP64+1    : 2'h3;
+            fpnew_pkg::FP16    : apu_lat_o = (C_LAT_FP16<2)    ? C_LAT_FP16+1    : 2'h3;
+            fpnew_pkg::FP16ALT : apu_lat_o = (C_LAT_FP16ALT<2) ? C_LAT_FP16ALT+1 : 2'h3;
+            fpnew_pkg::FP8     : apu_lat_o = (C_LAT_FP8<2)     ? C_LAT_FP8+1     : 2'h3;
             default : ;
           endcase
 
           // Set FPnew OP and OPMOD as the APU op
           apu_op_o = {fpu_vec_op, fpu_op_mod, fpu_op};
-
-        // No FPU or (ZFINX == 0 && MSTATUS.FS == FS_OFF)
-        end else begin
+        end
+        // FPU!=1
+        else begin
           illegal_insn_o = 1'b1;
         end
       end
 
       OPCODE_STORE_FP: begin
-        if (FPU == 1 && ZFINX == 0 && fs_off_i == 1'b0) begin
+        if (FPU==1) begin
           data_req            = 1'b1;
           data_we_o           = 1'b1;
           rega_used_o         = 1'b1;
@@ -1530,14 +1921,14 @@ module cv32e40p_decoder
             data_req       = 1'b0;
             data_we_o      = 1'b0;
           end
-        // No FPU or ZFINX or MSTATUS.FS == FS_OFF
-        end else begin
-          illegal_insn_o = 1'b1;
         end
+        // FPU!=1
+        else
+          illegal_insn_o = 1'b1;
       end
 
       OPCODE_LOAD_FP: begin
-        if (FPU == 1 && ZFINX == 0 && fs_off_i == 1'b0) begin
+        if (FPU==1) begin
           data_req            = 1'b1;
           regfile_mem_we      = 1'b1;
           reg_fp_d_o          = 1'b1;
@@ -1567,555 +1958,104 @@ module cv32e40p_decoder
                      else illegal_insn_o = 1'b1;
             default: illegal_insn_o = 1'b1;
           endcase
-        // No FPU or ZFINX or MSTATUS.FS == FS_OFF
-        end else begin
-          illegal_insn_o = 1'b1;
         end
+        // FPU!=1
+        else
+          illegal_insn_o = 1'b1;
       end
 
-      OPCODE_CUSTOM_0: begin
-        if (COREV_PULP && instr_rdata_i[14:13] != 2'b11) begin // cv.l[bhw][u] and cv.elw
-          data_req           = 1'b1;
-          regfile_mem_we     = 1'b1;
-          rega_used_o        = 1'b1;
-          alu_operator_o     = ALU_ADD;
-          // offset from immediate
-          alu_op_b_mux_sel_o = OP_B_IMM;
-          imm_b_mux_sel_o    = IMMB_I;
-
-          // post-increment setup
-          if (instr_rdata_i[13:12] != 2'b11) begin
-            prepost_useincr_o       = 1'b0;
-            regfile_alu_waddr_sel_o = 1'b0;
-            regfile_alu_we          = 1'b1;
-          end
-
-          // sign/zero extension
-          data_sign_extension_o = {1'b0,~instr_rdata_i[14]};
-
-          // load size
-          unique case (instr_rdata_i[13:12])
-            2'b00  : data_type_o = 2'b10; // LB/LBU
-            2'b01  : data_type_o = 2'b01; // LH/LHU
-            default: data_type_o = 2'b00; // LW/ELW
-          endcase
-
-          // special cv.elw (event load)
-          if (instr_rdata_i[13:12] == 2'b11) begin
-            if (COREV_CLUSTER) begin
-              data_load_event_o = 1'b1;
-            end else begin
-              // cv.elw only valid for COREV_CLUSTER = 1
-              illegal_insn_o    = 1'b1;
-            end
-          end
-        end else if (COREV_PULP) begin   // cv.beqimm and cv.bneimm 
-          ctrl_transfer_target_mux_sel_o = JT_COND;
-          ctrl_transfer_insn             = BRANCH_COND;
-          alu_op_c_mux_sel_o             = OP_C_JT;
-          rega_used_o                    = 1'b1;
-          // offset from immediate
-          alu_op_b_mux_sel_o             = OP_B_IMM;
-          imm_b_mux_sel_o                = IMMB_BI;
-
-          if (instr_rdata_i[12] == 1'b0) begin // cv.beqimm
-            alu_operator_o      = ALU_EQ;
-          end else begin                       // cv.bneimm
-            alu_operator_o      = ALU_NE;
-          end
-        end else begin
-          illegal_insn_o = 1'b1;
-        end
-      end
-
-      OPCODE_CUSTOM_1: begin
-        if (COREV_PULP) begin
-          unique case (instr_rdata_i[14:12])
-            3'b000, 3'b001, 3'b010: begin  // Immediate Post-Incremented Store
-              data_req                = 1'b1;
-              data_we_o               = 1'b1;
-              rega_used_o             = 1'b1;
-              regb_used_o             = 1'b1;
-              alu_operator_o          = ALU_ADD;
-              // pass write data through ALU operand c
-              alu_op_c_mux_sel_o      = OP_C_REGB_OR_FWD;
-              // offset from immediate
-              imm_b_mux_sel_o         = IMMB_S;
-              alu_op_b_mux_sel_o      = OP_B_IMM;
-
-              // post-increment setup
-              prepost_useincr_o       = 1'b0;
-              regfile_alu_waddr_sel_o = 1'b0;
-              regfile_alu_we          = 1'b1;
-
-              // store size
-              unique case (instr_rdata_i[13:12])
-                2'b00  : data_type_o = 2'b10; // SB
-                2'b01  : data_type_o = 2'b01; // SH
-                default: data_type_o = 2'b00; // SW
-              endcase
-            end
-
-            3'b011 : begin // Plane A
-              unique case (instr_rdata_i[31:25])
-                7'b0000000, 7'b0000001, 7'b0000010, 7'b0000011,         // Register Post-Incremented          Load
-                7'b0000100, 7'b0000101, 7'b0000110, 7'b0000111,         // Register Indexed                   Load
-                7'b0001000, 7'b0001001, 7'b0001010, 7'b0001011,         // Register Post-Incremented Unsigned Load
-                7'b0001100, 7'b0001101, 7'b0001110, 7'b0001111: begin   // Register Indexed          Unsigned Load
-                  data_req           = 1'b1;
-                  regfile_mem_we     = 1'b1;
-                  rega_used_o        = 1'b1;
-                  alu_operator_o     = ALU_ADD;
-                  // offset from RS2
-                  regb_used_o        = 1'b1;
-                  alu_op_b_mux_sel_o = OP_B_REGB_OR_FWD;
-
-                  // post-increment setup
-                  if (instr_rdata_i[27] == 1'b0) begin
-                    prepost_useincr_o       = 1'b0;
-                    regfile_alu_waddr_sel_o = 1'b0;
-                    regfile_alu_we          = 1'b1;
-                  end
-
-                  // sign/zero extension
-                  data_sign_extension_o = {1'b0,~instr_rdata_i[28]};
-
-                  // load size
-                  unique case ({instr_rdata_i[28],instr_rdata_i[26:25]})
-                    3'b000 : data_type_o = 2'b10; // LB
-                    3'b001 : data_type_o = 2'b01; // LH
-                    3'b010 : data_type_o = 2'b00; // LW
-                    3'b100 : data_type_o = 2'b10; // LBU
-                    3'b101 : data_type_o = 2'b01; // LHU
-                    default: begin
-                      illegal_insn_o = 1'b1;
-                      data_req       = 1'b0;
-                      regfile_mem_we = 1'b0;
-                      regfile_alu_we = 1'b0;
-                    end
-                  endcase
-                end
-
-                7'b0010000, 7'b0010001, 7'b0010010, 7'b0010011,         // Register Post-Incremented Store
-                7'b0010100, 7'b0010101, 7'b0010110, 7'b0010111: begin   // Register Indexed          Store
-                  data_req           = 1'b1;
-                  data_we_o          = 1'b1;
-                  rega_used_o        = 1'b1;
-                  regb_used_o        = 1'b1;
-                  alu_operator_o     = ALU_ADD;
-                  // pass write data through ALU operand c
-                  alu_op_c_mux_sel_o = OP_C_REGB_OR_FWD;
-                  // offset from register
-                  regc_used_o        = 1'b1;
-                  alu_op_b_mux_sel_o = OP_B_REGC_OR_FWD;
-                  regc_mux_o         = REGC_RD;
-
-                  // post-increment setup
-                  if (instr_rdata_i[27] == 1'b0) begin
-                    prepost_useincr_o       = 1'b0;
-                    regfile_alu_waddr_sel_o = 1'b0;
-                    regfile_alu_we          = 1'b1;
-                  end
-
-                  // store size
-                  unique case (instr_rdata_i[26:25])
-                    2'b00  : data_type_o = 2'b10; // SB
-                    2'b01  : data_type_o = 2'b01; // SH
-                    2'b10  : data_type_o = 2'b00; // SW
-                    default: begin
-                      illegal_insn_o = 1'b1;
-                      data_req       = 1'b0;
-                      data_we_o      = 1'b0;
-                      data_type_o    = 2'b00;
-                    end
-                  endcase
-                end
-
-                7'b0011000, 7'b0011001, 7'b0011010, 7'b0011011,
-                7'b0011100, 7'b0011101, 7'b0011110, 7'b0011111: begin   // Register Bit-Manipulation
-                  regfile_alu_we        = 1'b1;
-                  rega_used_o           = 1'b1;
-                  regb_used_o           = 1'b1;
-
-                  bmask_a_mux_o         = BMASK_A_S3;
-                  bmask_b_mux_o         = BMASK_B_S2;
-                  alu_op_b_mux_sel_o    = OP_B_IMM;
-                  alu_bmask_a_mux_sel_o = BMASK_A_REG;
-
-                  unique case (instr_rdata_i[27:25])
-                    3'b000: begin                                      // cv.extractr
-                      alu_operator_o        = ALU_BEXT;
-                      imm_b_mux_sel_o       = IMMB_S2;
-                      bmask_b_mux_o         = BMASK_B_ZERO;
-                      alu_op_b_mux_sel_o    = OP_B_BMASK;
-                    end
-                    3'b001: begin                                      // cv.extractur
-                      alu_operator_o        = ALU_BEXTU;
-                      imm_b_mux_sel_o       = IMMB_S2;
-                      bmask_b_mux_o         = BMASK_B_ZERO;
-                      alu_op_b_mux_sel_o    = OP_B_BMASK;
-                    end
-                    3'b010: begin                                      // cv.insertr
-                      alu_operator_o        = ALU_BINS;
-                      imm_b_mux_sel_o       = IMMB_S2;
-                      regc_used_o           = 1'b1;
-                      regc_mux_o            = REGC_RD;
-                      alu_op_b_mux_sel_o    = OP_B_BMASK;
-                      alu_bmask_b_mux_sel_o = BMASK_B_REG;
-                    end
-                    3'b100: begin                                      // cv.bclrr
-                      alu_operator_o        = ALU_BCLR;
-                      alu_bmask_b_mux_sel_o = BMASK_B_REG;
-                    end
-                    3'b101: begin                                      // cv.bsetr
-                      alu_operator_o        = ALU_BSET;
-                      alu_bmask_b_mux_sel_o = BMASK_B_REG;
-                    end
-                    default: illegal_insn_o = 1'b1;
-                  endcase
-                end
-
-                7'b0100000, 7'b0100001, 7'b0100010, 7'b0100011,
-                7'b0100100, 7'b0100101, 7'b0100110, 7'b0100111,
-                7'b0101000, 7'b0101001, 7'b0101010, 7'b0101011,
-                7'b0101100, 7'b0101101, 7'b0101110, 7'b0101111,
-                7'b0110000, 7'b0110001, 7'b0110010, 7'b0110011,
-                7'b0110100, 7'b0110101, 7'b0110110, 7'b0110111,
-                7'b0111000, 7'b0111001, 7'b0111010, 7'b0111011,
-                7'b0111100, 7'b0111101, 7'b0111110, 7'b0111111: begin  // General ALU
-                  regfile_alu_we = 1'b1;
-                  rega_used_o    = 1'b1;
-                  regb_used_o    = 1'b1;
-
-                  unique case (instr_rdata_i[29:25])
-                    5'b00000: alu_operator_o = ALU_ROR;                // cv.ror
-                    5'b00001: begin                                    // cv.ff1
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_FF1;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b00010: begin                                    // cv.fl1
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_FL1;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b00011: begin                                    // cv.clb
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_CLB;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b00100: begin                                    // cv.cnt
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_CNT;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b01000: begin                                    // cv.abs
-                      alu_operator_o = ALU_ABS;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b01001: alu_operator_o = ALU_SLETS;              // cv.slet
-                    5'b01010: alu_operator_o = ALU_SLETU;              // cv.sletu
-                    5'b01011: alu_operator_o = ALU_MIN;                // cv.min
-                    5'b01100: alu_operator_o = ALU_MINU;               // cv.minu
-                    5'b01101: alu_operator_o = ALU_MAX;                // cv.max
-                    5'b01110: alu_operator_o = ALU_MAXU;               // cv.maxu
-                    5'b10000: begin                                    // cv.exths
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_EXTS;
-                      alu_vec_mode_o = VEC_MODE16;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b10001: begin                                    // cv.exthz
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_EXT;
-                      alu_vec_mode_o = VEC_MODE16;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b10010: begin                                    // cv.extbs
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_EXTS;
-                      alu_vec_mode_o = VEC_MODE8;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b10011: begin                                    // cv.extbz
-                      regb_used_o    = 1'b0;
-                      alu_operator_o = ALU_EXT;
-                      alu_vec_mode_o = VEC_MODE8;
-                      if (instr_rdata_i[24:20] != 5'b0) begin
-                        illegal_insn_o = 1'b1;
-                      end
-                    end
-                    5'b11000: begin                                    // cv.clip
-                      regb_used_o        = 1'b0;
-                      alu_operator_o     = ALU_CLIP;
-                      alu_op_b_mux_sel_o = OP_B_IMM;
-                      imm_b_mux_sel_o    = IMMB_CLIP;
-                    end
-                    5'b11001: begin                                    // cv.clipu
-                      regb_used_o        = 1'b0;
-                      alu_operator_o     = ALU_CLIPU;
-                      alu_op_b_mux_sel_o = OP_B_IMM;
-                      imm_b_mux_sel_o    = IMMB_CLIP;
-                    end
-                    5'b11010: alu_operator_o = ALU_CLIP;               // cv.clipr
-                    5'b11011: alu_operator_o = ALU_CLIPU;              // cv.clipur
-                    default : illegal_insn_o = 1'b1;
-                  endcase
-                end
-
-                7'b1000000, 7'b1000001, 7'b1000010, 7'b1000011,
-                7'b1000100, 7'b1000101, 7'b1000110, 7'b1000111: begin  // Add/Sub with Normalization and Rounding
-                  regfile_alu_we        = 1'b1;
-                  rega_used_o           = 1'b1;
-                  regb_used_o           = 1'b1;
-                  regc_used_o           = 1'b1;
-                  regc_mux_o            = REGC_RD;
-                  bmask_a_mux_o         = BMASK_A_ZERO;
-                  bmask_b_mux_o         = BMASK_B_S3;
-                  alu_bmask_b_mux_sel_o = BMASK_B_REG;
-                  alu_op_a_mux_sel_o    = OP_A_REGC_OR_FWD;
-                  alu_op_b_mux_sel_o    = OP_B_REGA_OR_FWD;
-
-                  unique case (instr_rdata_i[27:25])
-                    3'b001:  alu_operator_o = ALU_ADDU;                 // cv.adduNr
-                    3'b010:  alu_operator_o = ALU_ADDR;                 // cv.addRNr
-                    3'b011:  alu_operator_o = ALU_ADDUR;                // cv.adduRNr
-                    3'b100:  alu_operator_o = ALU_SUB;                  // cv.subNr
-                    3'b101:  alu_operator_o = ALU_SUBU;                 // cv.subuNr
-                    3'b110:  alu_operator_o = ALU_SUBR;                 // cv.subRNr
-                    3'b111:  alu_operator_o = ALU_SUBUR;                // cv.subuRNr
-                    default: alu_operator_o = ALU_ADD;                  // cv.addNr
-                  endcase
-                end
-
-                7'b1001000, 7'b1001001: begin
-                  alu_en          = 1'b0;
-                  mult_int_en     = 1'b1;
-                  regfile_alu_we  = 1'b1;
-                  rega_used_o     = 1'b1;
-                  regb_used_o     = 1'b1;
-                  regc_used_o     = 1'b1;
-                  regc_mux_o      = REGC_RD;
-
-                  if (instr_rdata_i[25] == 1'b0) begin
-                    mult_operator_o = MUL_MAC32;                       // cv.mac
-                  end else begin
-                    mult_operator_o = MUL_MSU32;                       // cv.msu
-                  end
-                end
-
-                default: illegal_insn_o = 1'b1;
-              endcase
-            end // Plane A
-
-            ///////////////////////////////////////////////
-            //  _   ___        ___     ___   ___  ____   //
-            // | | | \ \      / / |   / _ \ / _ \|  _ \  //
-            // | |_| |\ \ /\ / /| |  | | | | | | | |_) | //
-            // |  _  | \ V  V / | |__| |_| | |_| |  __/  //
-            // |_| |_|  \_/\_/  |_____\___/ \___/|_|     //
-            //                                           //
-            ///////////////////////////////////////////////
-            3'b100 : begin // Plane B
-              hwlp_target_mux_sel_o = 2'b0;
-
-              unique case (instr_rdata_i[11:8])
-                4'b0000: begin
-                  // lp.starti: set start address to PC + I-type immediate
-                  hwlp_we[0]           = 1'b1;
-                  hwlp_start_mux_sel_o = 2'b0;
-                  if (instr_rdata_i[19:15] != 5'b0) begin
-                    illegal_insn_o = 1'b1;
-                  end
-                end
-                4'b0001: begin
-                  // lp.start: set start address to rs1 content
-                  hwlp_we[0]           = 1'b1;
-                  hwlp_start_mux_sel_o = 2'b10;
-                  rega_used_o          = 1'b1;
-                  if (instr_rdata_i[31:20] != 12'b0) begin
-                    illegal_insn_o = 1'b1;
-                  end
-                end
-                4'b0010: begin
-                  // lp.endi: set end address to PC + I-type immediate - 4
-                  hwlp_we[1] = 1'b1;
-                  if (instr_rdata_i[19:15] != 5'b0) begin
-                    illegal_insn_o = 1'b1;
-                  end
-                end
-                4'b0011: begin
-                  // lp.end: set end address to (rs1 - 4) content
-                  hwlp_we[1]            = 1'b1;
-                  hwlp_target_mux_sel_o = 2'b10;
-                  rega_used_o           = 1'b1;
-                  if (instr_rdata_i[31:20] != 12'b0) begin
-                    illegal_insn_o = 1'b1;
-                  end
-                end
-                4'b0100: begin
-                  // lp.counti: initialize counter from I-type immediate
-                  hwlp_we[2]         = 1'b1;
-                  hwlp_cnt_mux_sel_o = 1'b0;
-                  if (instr_rdata_i[19:15] != 5'b0) begin
-                    illegal_insn_o = 1'b1;
-                  end
-                end
-                4'b0101: begin
-                  // lp.count: initialize counter from rs1
-                  hwlp_we[2]         = 1'b1;
-                  hwlp_cnt_mux_sel_o = 1'b1;
-                  rega_used_o        = 1'b1;
-                  if (instr_rdata_i[31:20] != 12'b0) begin
-                    illegal_insn_o = 1'b1;
-                  end
-                end
-                4'b0110: begin
-                  // lp.setupi: initialize counter from immediate, set start address to
-                  // next instruction and end address to PC + I-type immediate - 4
-                  hwlp_we               = 3'b111;
-                  hwlp_target_mux_sel_o = 2'b01;
-                  hwlp_start_mux_sel_o  = 2'b01;
-                  hwlp_cnt_mux_sel_o    = 1'b0;
-                end
-                4'b0111: begin
-                  // lp.setup: initialize counter from rs1, set start address to
-                  // next instruction and end address to PC + I-type immediate - 4
-                  hwlp_we              = 3'b111;
-                  hwlp_start_mux_sel_o = 2'b01;
-                  hwlp_cnt_mux_sel_o   = 1'b1;
-                  rega_used_o          = 1'b1;
-                end
-                default: begin
-                  illegal_insn_o = 1'b1;
-                end
-              endcase
-            end // Plane B
-
-            default: illegal_insn_o = 1'b1;
-          endcase
-
-        end else begin
-          illegal_insn_o = 1'b1;
-        end
-      end
-
-      OPCODE_CUSTOM_2: begin  // PULP specific ALU instructions with two source operands and one immediate
-        if (COREV_PULP) begin
+      OPCODE_PULP_OP: begin  // PULP specific ALU instructions with three source operands
+        if (PULP_XPULP) begin
           regfile_alu_we = 1'b1;
           rega_used_o    = 1'b1;
           regb_used_o    = 1'b1;
 
-          unique case (instr_rdata_i[14:13])
-            2'b00: begin
-              // Bit Manipulation instructions
-              regb_used_o         = 1'b0;
-              bmask_a_mux_o       = BMASK_A_S3;
-              bmask_b_mux_o       = BMASK_B_S2;
-              alu_op_b_mux_sel_o  = OP_B_IMM;
-     
-              unique case ({instr_rdata_i[31:30], instr_rdata_i[12]})
-                {2'b00, 1'b0}: begin                                       // cv.extract
-                  alu_operator_o  = ALU_BEXT;
-                  imm_b_mux_sel_o = IMMB_S2;
-                  bmask_b_mux_o   = BMASK_B_ZERO;
-                end
-                {2'b01, 1'b0}: begin                                       // cv.extractu
-                  alu_operator_o  = ALU_BEXTU;
-                  imm_b_mux_sel_o = IMMB_S2;
-                  bmask_b_mux_o   = BMASK_B_ZERO;
-                end
-                {2'b10, 1'b0}: begin                                       // cv.insert
-                  alu_operator_o  = ALU_BINS;
-                  imm_b_mux_sel_o = IMMB_S2;
-                  regc_used_o     = 1'b1;
-                  regc_mux_o      = REGC_RD;
-                end
-                {2'b00, 1'b1}: begin                                       // cv.bclr
-                  alu_operator_o = ALU_BCLR;
-                end
-                {2'b01, 1'b1}: begin                                       // cv.bset
-                  alu_operator_o = ALU_BSET;
-                end
-                {2'b11, 1'b1}: begin                                       // cv.bitrev
-                  alu_operator_o        = ALU_BREV;
-                  // Enable write back to RD
-                  regc_used_o           = 1'b1;
-                  regc_mux_o            = REGC_RD;
-                  // Extract the source register on operand a
-                  imm_b_mux_sel_o       = IMMB_S2;
-                  // Map the radix to bmask_a immediate
-                  alu_bmask_a_mux_sel_o = BMASK_A_IMM;
-                  if (instr_rdata_i[29:27] != 3'b0) begin
-                    illegal_insn_o = 1'b1;
-                  end
-                end
-                default: illegal_insn_o = 1'b1;
-              endcase
-            end
-
-            2'b01: begin
-              // ADD/SUB with normalization and rounding
-              bmask_a_mux_o  = BMASK_A_ZERO;
-              bmask_b_mux_o  = BMASK_B_S3;
-
-              // decide between using unsigned and rounding, and combinations
-              unique case ({instr_rdata_i[31:30], instr_rdata_i[12]})
-                {2'b01, 1'b0}: alu_operator_o = ALU_ADDU;                  // cv.adduN
-                {2'b10, 1'b0}: alu_operator_o = ALU_ADDR;                  // cv.addRN
-                {2'b11, 1'b0}: alu_operator_o = ALU_ADDUR;                 // cv.adduRN
-                {2'b00, 1'b1}: alu_operator_o = ALU_SUB;                   // cv.subN
-                {2'b01, 1'b1}: alu_operator_o = ALU_SUBU;                  // cv.subuN
-                {2'b10, 1'b1}: alu_operator_o = ALU_SUBR;                  // cv.subRN
-                {2'b11, 1'b1}: alu_operator_o = ALU_SUBUR;                 // cv.subuRN
-                default      : alu_operator_o = ALU_ADD;                   // cv.addN
-              endcase
-
-            end
-
-            default: begin
-              // MUL/MAC with subword selection
+          case (instr_rdata_i[13:12])
+            2'b00: begin // multiply with subword selection
               alu_en             = 1'b0;
-              mult_int_en        = 1'b1;
 
-              mult_imm_mux_o     = MIMM_S3;
-              mult_sel_subword_o = instr_rdata_i[30];                      // cv.mulhhsN, cv.mulhhsRN, cv.mulhhuN, cv.mulhhuRN
-                                                                           // cv.machhsN, cv.machhsRN, cv.machhuN, cv.machhuRN
-              mult_signed_mode_o = {2{~instr_rdata_i[12]}};                // cv.mulsN,   cv.mulhhsN,  cv.mulsRN,  cv.mulhhsRN
-                                                                           // cv.macsN,   cv.machhsN,  cv.macsRN,  cv.machhsRN
+              mult_sel_subword_o = instr_rdata_i[30];
+              mult_signed_mode_o = {2{instr_rdata_i[31]}};
 
-              if (instr_rdata_i[13]) begin                                 // cv.macsN,   cv.machhsN,  cv.macsRN,  cv.machhsRN
-                                                                           // cv.macuN,   cv.machhuN,  cv.macuRN,  cv.machhuRN
-                regc_used_o = 1'b1;
-                regc_mux_o  = REGC_RD;
-              end else begin                                               // cv.mulsN,   cv.mulhhsN,  cv.mulsRN,  cv.mulhhsRN
-                                                                           // cv.muluN,   cv.mulhhuN,  cv.muluRN,  cv.mulhhuRN
-                regc_mux_o  = REGC_ZERO;
-              end
+              mult_imm_mux_o = MIMM_S3;
+              regc_mux_o     = REGC_ZERO;
+              mult_int_en    = 1'b1;
 
-              if (instr_rdata_i[31]) begin                                 // cv.mulsRN,  cv.mulhhsRN, cv.muluRN,  cv.mulhhuRN
-                                                                           // cv.macsRN,  cv.machhsRN, cv.macuRN,  cv.machhuRN
+              if (instr_rdata_i[14])
                 mult_operator_o = MUL_IR;
-              end else begin                                               // cv.mulsN,   cv.mulhhsN,  cv.muluN,   cv.mulhhuN
-                                                                           // cv.macsN,   cv.machhsN,  cv.macuN,   cv.machhuN
+              else
                 mult_operator_o = MUL_I;
+            end
+
+            2'b01: begin // MAC with subword selection
+              alu_en             = 1'b0;
+
+              mult_sel_subword_o = instr_rdata_i[30];
+              mult_signed_mode_o = {2{instr_rdata_i[31]}};
+
+              regc_used_o     = 1'b1;
+              regc_mux_o      = REGC_RD;
+              mult_imm_mux_o  = MIMM_S3;
+              mult_int_en     = 1'b1;
+
+              if (instr_rdata_i[14])
+                mult_operator_o = MUL_IR;
+              else
+                mult_operator_o = MUL_I;
+            end
+
+            2'b10: begin // add with normalization and rounding
+              // decide between using unsigned and rounding, and combinations
+              // thereof
+              case ({instr_rdata_i[31],instr_rdata_i[14]})
+                2'b00: alu_operator_o = ALU_ADD;
+                2'b01: alu_operator_o = ALU_ADDR;
+                2'b10: alu_operator_o = ALU_ADDU;
+                2'b11: alu_operator_o = ALU_ADDUR;
+              endcase
+
+              bmask_a_mux_o = BMASK_A_ZERO;
+              bmask_b_mux_o = BMASK_B_S3;
+
+              if (instr_rdata_i[30]) begin
+                //register variant
+                regc_used_o            = 1'b1;
+                regc_mux_o             = REGC_RD;
+                alu_bmask_b_mux_sel_o  = BMASK_B_REG;
+                alu_op_a_mux_sel_o     = OP_A_REGC_OR_FWD;
+                alu_op_b_mux_sel_o     = OP_B_REGA_OR_FWD;
+                if(instr_rdata_i[29:25] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
               end
+
+            end
+
+            2'b11: begin // sub with normalization and rounding
+              // decide between using unsigned and rounding, and combinations
+              // thereof
+              case ({instr_rdata_i[31],instr_rdata_i[14]})
+                2'b00: alu_operator_o = ALU_SUB;
+                2'b01: alu_operator_o = ALU_SUBR;
+                2'b10: alu_operator_o = ALU_SUBU;
+                2'b11: alu_operator_o = ALU_SUBUR;
+              endcase
+
+              bmask_a_mux_o = BMASK_A_ZERO;
+              bmask_b_mux_o = BMASK_B_S3;
+
+              if (instr_rdata_i[30]) begin
+                //register variant
+                regc_used_o            = 1'b1;
+                regc_mux_o             = REGC_RD;
+                alu_bmask_b_mux_sel_o  = BMASK_B_REG;
+                alu_op_a_mux_sel_o     = OP_A_REGC_OR_FWD;
+                alu_op_b_mux_sel_o     = OP_B_REGA_OR_FWD;
+                if(instr_rdata_i[29:25] != 5'b0) begin
+                  illegal_insn_o = 1'b1;
+                end
+              end
+
             end
           endcase
         end else begin
@@ -2123,19 +2063,18 @@ module cv32e40p_decoder
         end
       end
 
-      OPCODE_CUSTOM_3: begin
-        if (COREV_PULP) begin
+      OPCODE_VECOP: begin
+        if (PULP_XPULP) begin
           regfile_alu_we      = 1'b1;
           rega_used_o         = 1'b1;
           imm_b_mux_sel_o     = IMMB_VS;
 
-          alu_vec_o = 1'b1;
           // vector size
           if (instr_rdata_i[12]) begin
             alu_vec_mode_o  = VEC_MODE8;
             mult_operator_o = MUL_DOT8;
           end else begin
-            alu_vec_mode_o  = VEC_MODE16;
+            alu_vec_mode_o = VEC_MODE16;
             mult_operator_o = MUL_DOT16;
           end
 
@@ -2163,8 +2102,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2174,8 +2112,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2186,8 +2123,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2198,8 +2134,7 @@ module cv32e40p_decoder
              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                illegal_insn_o = 1'b1;
              end
-             if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                 instr_rdata_i[25] != 1'b0) begin
+             if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                illegal_insn_o = 1'b1;
              end
             end
@@ -2209,8 +2144,7 @@ module cv32e40p_decoder
              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                illegal_insn_o = 1'b1;
              end
-             if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                 instr_rdata_i[25] != 1'b0) begin
+             if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                illegal_insn_o = 1'b1;
              end
             end
@@ -2220,8 +2154,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2231,8 +2164,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2242,8 +2174,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2253,13 +2184,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-              // Imm6 restrictions
-              if ((instr_rdata_i[14:12] == 3'b110 && instr_rdata_i[24:23] != 2'b0) ||
-                  (instr_rdata_i[14:12] == 3'b111 && instr_rdata_i[24:22] != 3'b0)) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2269,13 +2194,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-              // Imm6 restrictions
-              if ((instr_rdata_i[14:12] == 3'b110 && instr_rdata_i[24:23] != 2'b0) ||
-                  (instr_rdata_i[14:12] == 3'b111 && instr_rdata_i[24:22] != 3'b0)) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2285,13 +2204,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-              // Imm6 restrictions
-              if ((instr_rdata_i[14:12] == 3'b110 && instr_rdata_i[24:23] != 2'b0) ||
-                  (instr_rdata_i[14:12] == 3'b111 && instr_rdata_i[24:22] != 3'b0)) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2301,8 +2214,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2312,8 +2224,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2323,18 +2234,106 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
             6'b01110_0: begin // cv.abs
               alu_operator_o = ALU_ABS;
               imm_b_mux_sel_o = IMMB_VS;
-              if (instr_rdata_i[14:12] != 3'b000 && instr_rdata_i[14:12] != 3'b001) begin
+              if (!(instr_rdata_i[14:12] == 3'b000 || instr_rdata_i[14:12] == 3'b001)) begin
                 illegal_insn_o = 1'b1;
               end
               if (instr_rdata_i[25:20] != 6'b000000) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b11000_0: begin // cv.shuffle, cv.shuffleI0
+              alu_operator_o       = ALU_SHUF;
+              imm_b_mux_sel_o      = IMMB_SHUF;
+              regb_used_o          = 1'b1;
+              scalar_replication_o = 1'b0;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011 || instr_rdata_i[14:12] == 3'b100
+                  || instr_rdata_i[14:12] == 3'b101) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b11101_0,
+            6'b11110_0,
+            6'b11111_0: begin // cv.shuffleI1 cv.shuffleI2 cv.shuffleI3
+              alu_operator_o       = ALU_SHUF;
+              imm_b_mux_sel_o      = IMMB_SHUF;
+              regb_used_o          = 1'b1;
+              scalar_replication_o = 1'b0;
+              if (instr_rdata_i[14:12] != 3'b111) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b11001_0: begin // cv.shuffle2
+              alu_operator_o       = ALU_SHUF2;
+              regb_used_o          = 1'b1;
+              regc_used_o          = 1'b1;
+              regc_mux_o           = REGC_RD;
+              scalar_replication_o = 1'b0;
+              if (!(instr_rdata_i[14:12] == 3'b000 || instr_rdata_i[14:12] == 3'b001)) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[25] != 1'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b11010_0: begin // cv.pack
+              alu_operator_o = instr_rdata_i[25] ? ALU_PCKHI : ALU_PCKLO;
+              regb_used_o    = 1'b1;
+              if (instr_rdata_i[14:12] != 3'b000) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b11011_0: begin // cv.packhi
+              alu_operator_o = ALU_PCKHI;
+              regb_used_o    = 1'b1;
+              regc_used_o    = 1'b1;
+              regc_mux_o     = REGC_RD;
+              if (instr_rdata_i[14:12] != 3'b001) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[25] != 1'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b11100_0: begin // cv.packlo
+              alu_operator_o = ALU_PCKLO;
+              regb_used_o    = 1'b1;
+              regc_used_o    = 1'b1;
+              regc_mux_o     = REGC_RD;
+              if (instr_rdata_i[14:12] != 3'b001) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[25] != 1'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b01111_0: begin // cv.extract
+              alu_operator_o = ALU_EXTS;
+              if (!(instr_rdata_i[14:12] == 3'b110 || instr_rdata_i[14:12] == 3'b111)) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b10010_0: begin // cv.extractu
+              alu_operator_o = ALU_EXT;
+              if (!(instr_rdata_i[14:12] == 3'b110 || instr_rdata_i[14:12] == 3'b111)) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b10110_0: begin // cv.insert
+              alu_operator_o     = ALU_INS;
+              regc_used_o        = 1'b1;
+              regc_mux_o         = REGC_RD;
+              alu_op_b_mux_sel_o = OP_B_REGC_OR_FWD;
+              if (!(instr_rdata_i[14:12] == 3'b110 || instr_rdata_i[14:12] == 3'b111)) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2346,8 +2345,7 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2358,24 +2356,22 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
-            6'b10010_0: begin // cv.dotsp
+            6'b10011_0: begin // cv.dotsp
               alu_en            = 1'b0;
               mult_dot_en       = 1'b1;
               mult_dot_signed_o = 2'b11;
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
-            6'b10011_0: begin // cv.sdotup
+            6'b10100_0: begin // cv.sdotup
               alu_en            = 1'b0;
               mult_dot_en       = 1'b1;
               mult_dot_signed_o = 2'b00;
@@ -2385,12 +2381,11 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
-            6'b10100_0: begin // cv.sdotusp
+            6'b10101_0: begin // cv.sdotusp
               alu_en            = 1'b0;
               mult_dot_en       = 1'b1;
               mult_dot_signed_o = 2'b01;
@@ -2399,12 +2394,11 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
-            6'b10101_0: begin // cv.sdotsp
+            6'b10111_0: begin // cv.sdotsp
               alu_en            = 1'b0;
               mult_dot_en       = 1'b1;
               mult_dot_signed_o = 2'b11;
@@ -2413,202 +2407,14 @@ module cv32e40p_decoder
               if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
                 illegal_insn_o = 1'b1;
               end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b10111_0: begin
-              unique case (instr_rdata_i[14:13])
-                2'b00: alu_operator_o = ALU_EXTS; // cv.extract
-                2'b01: alu_operator_o = ALU_EXT;  // cv.extractu
-                2'b10: begin                      // cv.insert
-                  alu_operator_o     = ALU_INS;
-                  regc_used_o        = 1'b1;
-                  regc_mux_o         = REGC_RD;
-                  alu_op_b_mux_sel_o = OP_B_REGC_OR_FWD;
-                end
-                default: illegal_insn_o = 1'b1;
-              endcase
-              // Imm6 restrictions
-              if ((instr_rdata_i[12] == 1'b0 && instr_rdata_i[24:20] != 5'b0) ||
-                  (instr_rdata_i[12] == 1'b1 && instr_rdata_i[24:21] != 4'b0)) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b11000_0: begin // cv.shuffle, cv.shuffleI0
-              alu_operator_o       = ALU_SHUF;
-              imm_b_mux_sel_o      = IMMB_SHUF;
-              regb_used_o          = 1'b1;
-              scalar_replication_o = 1'b0;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011 ||
-                  instr_rdata_i[14:12] == 3'b100 || instr_rdata_i[14:12] == 3'b101) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-              // Imm6 restriction
-              if (instr_rdata_i[14:12] == 3'b110 && instr_rdata_i[24:21] != 4'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b11001_0,
-            6'b11010_0,
-            6'b11011_0: begin // cv.shuffleI1 cv.shuffleI2 cv.shuffleI3
-              alu_operator_o       = ALU_SHUF;
-              imm_b_mux_sel_o      = IMMB_SHUF;
-              regb_used_o          = 1'b1;
-              scalar_replication_o = 1'b0;
-              if (instr_rdata_i[14:12] != 3'b111) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b11100_0: begin // cv.shuffle2
-              alu_operator_o       = ALU_SHUF2;
-              regb_used_o          = 1'b1;
-              regc_used_o          = 1'b1;
-              regc_mux_o           = REGC_RD;
-              scalar_replication_o = 1'b0;
-              if (instr_rdata_i[14:12] != 3'b000 && instr_rdata_i[14:12] != 3'b001) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b11110_0: begin // cv.pack, cv.pack.h
-              alu_operator_o = instr_rdata_i[25] ? ALU_PCKHI : ALU_PCKLO;
-              regb_used_o    = 1'b1;
-              if (instr_rdata_i[14:12] != 3'b000) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b11111_0: begin // cv.packhi, cv.packlo
-              alu_operator_o = instr_rdata_i[25] ? ALU_PCKHI : ALU_PCKLO;
-              regb_used_o    = 1'b1;
-              regc_used_o    = 1'b1;
-              regc_mux_o     = REGC_RD;
-              if (instr_rdata_i[14:12] != 3'b001) begin
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
 
-            // Comparisons, always have bit 26 set
-            6'b00000_1: begin // cv.cmpeq
-              alu_operator_o  = ALU_EQ;
-              imm_b_mux_sel_o = IMMB_VS;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b00001_1: begin // cv.cmpne
-              alu_operator_o  = ALU_NE;
-              imm_b_mux_sel_o = IMMB_VS;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b00010_1: begin // cv.cmpgt
-              alu_operator_o  = ALU_GTS;
-              imm_b_mux_sel_o = IMMB_VS;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b00011_1: begin // cv.cmpge
-              alu_operator_o  = ALU_GES;
-              imm_b_mux_sel_o = IMMB_VS;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b00100_1: begin // cv.cmplt
-              alu_operator_o  = ALU_LTS;
-              imm_b_mux_sel_o = IMMB_VS;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b00101_1: begin // cv.cmple
-              alu_operator_o  = ALU_LES;
-              imm_b_mux_sel_o = IMMB_VS;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b00110_1: begin // cv.cmpgtu
-              alu_operator_o  = ALU_GTU;
-              imm_b_mux_sel_o = IMMB_VU;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b00111_1: begin // cv.cmpgeu
-              alu_operator_o  = ALU_GEU;
-              imm_b_mux_sel_o = IMMB_VU;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b01000_1: begin // cv.cmpltu
-              alu_operator_o  = ALU_LTU;
-              imm_b_mux_sel_o = IMMB_VU;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b01001_1: begin // cv.cmpleu
-              alu_operator_o  = ALU_LEU;
-              imm_b_mux_sel_o = IMMB_VU;
-              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
-                illegal_insn_o = 1'b1;
-              end
-              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 &&
-                  instr_rdata_i[25] != 1'b0) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
+            /*  COMPLEX INSTRUCTIONS */
 
-            /*  Complex instructions */
-            6'b01010_1: begin // cv.cplxmul.{r,i}.{/,div2,div4,div8}
+            6'b01010_1: begin // cv.clpxmul.{r,i}.{/,div2,div4,div8}
               alu_en               = 1'b0;
               mult_dot_en          = 1'b1;
               mult_dot_signed_o    = 2'b11;
@@ -2620,45 +2426,158 @@ module cv32e40p_decoder
               regb_used_o          = 1'b1;
               illegal_insn_o       = instr_rdata_i[12];
             end
-            6'b01011_1: begin // cv.cplxconj
-              alu_operator_o       = ALU_ABS;
-              is_clpx_o            = 1'b1;
-              scalar_replication_o = 1'b0;
-              regb_used_o          = 1'b0;
-              if (instr_rdata_i[14:12] != 3'b000 || instr_rdata_i[25:20] != 6'b000000) begin
-                illegal_insn_o = 1'b1;
-              end
-            end
-            6'b01100_1: begin // cv.subrotmj.{/,div2,div4,div8}
+
+            6'b01101_1: begin // cv.subrotmj.{/,div2,div4,div8}
               alu_operator_o       = ALU_SUB;
               is_clpx_o            = 1'b1;
               scalar_replication_o = 1'b0;
               alu_op_b_mux_sel_o   = OP_B_REGB_OR_FWD;
               regb_used_o          = 1'b1;
               is_subrot_o          = 1'b1;
-              if (instr_rdata_i[12] != 1'b0 || instr_rdata_i[25] != 1'b0) begin
+              if (instr_rdata_i[25] != 1'b0 || instr_rdata_i[12] != 1'b0) begin
                 illegal_insn_o = 1'b1;
               end
             end
-            6'b01101_1: begin // cv.add.{div2,div4,div8}
+
+            6'b01011_1: begin // cv.cplxconj
+              alu_operator_o       = ALU_ABS;
+              is_clpx_o            = 1'b1;
+              scalar_replication_o = 1'b0;
+              regb_used_o          = 1'b0;
+              if (instr_rdata_i[14:12] != 3'b000) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[25:20] != 6'b000000) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
+            6'b01110_1: begin // cv.add.{div2,div4,div8}
               alu_operator_o       = ALU_ADD;
               is_clpx_o            = 1'b1;
               scalar_replication_o = 1'b0;
               alu_op_b_mux_sel_o   = OP_B_REGB_OR_FWD;
               regb_used_o          = 1'b1;
-              if (instr_rdata_i[12] != 1'b0 || instr_rdata_i[14:12] == 3'b000 ||
-                  instr_rdata_i[25] != 1'b0) begin
+              if (!(instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b100 || instr_rdata_i[14:12] == 3'b110)) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[25] != 1'b0) begin
                 illegal_insn_o = 1'b1;
               end
             end
-            6'b01110_1: begin // cv.sub.{div2,div4,div8}
+
+            6'b01100_1: begin // cv.sub.{div2,div4,div8}
               alu_operator_o       = ALU_SUB;
               is_clpx_o            = 1'b1;
               scalar_replication_o = 1'b0;
               alu_op_b_mux_sel_o   = OP_B_REGB_OR_FWD;
               regb_used_o          = 1'b1;
-              if (instr_rdata_i[12] != 1'b0 || instr_rdata_i[14:12] == 3'b000 ||
-                  instr_rdata_i[25] != 1'b0) begin
+              if (!(instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b100 || instr_rdata_i[14:12] == 3'b110)) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[25] != 1'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
+            // comparisons, always have bit 26 set
+            6'b00000_1: begin // cv.cmpeq
+              alu_operator_o  = ALU_EQ;
+              imm_b_mux_sel_o = IMMB_VS;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b00001_1: begin // cv.cmpne
+              alu_operator_o  = ALU_NE;
+              imm_b_mux_sel_o = IMMB_VS;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b00010_1: begin // cv.cmpgt
+              alu_operator_o  = ALU_GTS;
+              imm_b_mux_sel_o = IMMB_VS;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b00011_1: begin // cv.cmpge
+              alu_operator_o  = ALU_GES;
+              imm_b_mux_sel_o = IMMB_VS;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b00100_1: begin // cv.cmplt
+              alu_operator_o  = ALU_LTS;
+              imm_b_mux_sel_o = IMMB_VS;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b00101_1: begin // cv.cmple
+              alu_operator_o  = ALU_LES;
+              imm_b_mux_sel_o = IMMB_VS;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b00110_1: begin // cv.cmpgtu
+              alu_operator_o  = ALU_GTU;
+              imm_b_mux_sel_o = IMMB_VU;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b00111_1: begin // cv.cmpgeu
+              alu_operator_o  = ALU_GEU;
+              imm_b_mux_sel_o = IMMB_VU;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b01000_1: begin // cv.cmpltu
+              alu_operator_o  = ALU_LTU;
+              imm_b_mux_sel_o = IMMB_VU;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+            6'b01001_1: begin // cv.cmpleu
+              alu_operator_o  = ALU_LEU;
+              imm_b_mux_sel_o = IMMB_VU;
+              if (instr_rdata_i[14:12] == 3'b010 || instr_rdata_i[14:12] == 3'b011) begin
+                illegal_insn_o = 1'b1;
+              end
+              if (instr_rdata_i[14:12] != 3'b110 && instr_rdata_i[14:12] != 3'b111 && instr_rdata_i[25] != 1'b0 ) begin
                 illegal_insn_o = 1'b1;
               end
             end
@@ -2691,7 +2610,9 @@ module cv32e40p_decoder
             fencei_insn_o = 1'b1;
           end
 
-          default: illegal_insn_o =  1'b1;
+          default: begin
+            illegal_insn_o =  1'b1;
+          end
         endcase
       end
 
@@ -2740,15 +2661,18 @@ module cv32e40p_decoder
                 wfi_o = 1'b1;
                 if (debug_wfi_no_sleep_i) begin
                   // Treat as NOP (do not cause sleep mode entry)
-                  // Using decoding similar to ADDI, but without register reads/writes,
-                  // i.e. keep regfile_alu_we = 0, rega_used_o = 0
+                  // Using decoding similar to ADDI, but without register reads/writes, i.e.
+                  // keep regfile_alu_we = 0, rega_used_o = 0
                   alu_op_b_mux_sel_o = OP_B_IMM;
                   imm_b_mux_sel_o = IMMB_I;
                   alu_operator_o = ALU_ADD;
                 end
               end
 
-              default: illegal_insn_o = 1'b1;
+              default:
+              begin
+                illegal_insn_o = 1'b1;
+              end
             endcase
           end else illegal_insn_o = 1'b1;
         end
@@ -2770,12 +2694,12 @@ module cv32e40p_decoder
           end
 
           // instr_rdata_i[19:14] = rs or immediate value
-          //   if set or clear with rs == x0 or imm == 0,
+          //   if set or clear with rs==x0 or imm==0,
           //   then do not perform a write action
           unique case (instr_rdata_i[13:12])
-            2'b01:   csr_op = CSR_OP_WRITE;
-            2'b10:   csr_op = instr_rdata_i[19:15] == 5'b0 ? CSR_OP_READ : CSR_OP_SET;
-            2'b11:   csr_op = instr_rdata_i[19:15] == 5'b0 ? CSR_OP_READ : CSR_OP_CLEAR;
+            2'b01:   csr_op   = CSR_OP_WRITE;
+            2'b10:   csr_op   = instr_rdata_i[19:15] == 5'b0 ? CSR_OP_READ : CSR_OP_SET;
+            2'b11:   csr_op   = instr_rdata_i[19:15] == 5'b0 ? CSR_OP_READ : CSR_OP_CLEAR;
             default: csr_illegal = 1'b1;
           endcase
 
@@ -2787,24 +2711,17 @@ module cv32e40p_decoder
           // Determine if CSR access is illegal
           case (instr_rdata_i[31:20])
             // Floating point
-            CSR_FFLAGS :
-                if (FPU == 0 || fs_off_i == 1'b1) csr_illegal = 1'b1;
-
-            CSR_FRM,
+            CSR_FFLAGS,
+              CSR_FRM,
               CSR_FCSR :
-                if (FPU == 0 || fs_off_i == 1'b1) begin
-                  csr_illegal = 1'b1;
-                end else begin
-                  // FRM updated value needed by following FPU instruction
-                  if (csr_op != CSR_OP_READ) csr_status_o = 1'b1;
-                end
+                if(!FPU) csr_illegal = 1'b1;
 
             //  Writes to read only CSRs results in illegal instruction
             CSR_MVENDORID,
               CSR_MARCHID,
               CSR_MIMPID,
               CSR_MHARTID :
-                if (csr_op != CSR_OP_READ) csr_illegal = 1'b1;
+                if(csr_op != CSR_OP_READ) csr_illegal = 1'b1;
 
             // These are valid CSR registers
             CSR_MSTATUS,
@@ -2877,8 +2794,7 @@ module cv32e40p_decoder
               CSR_HPMCOUNTER24H, CSR_HPMCOUNTER25H, CSR_HPMCOUNTER26H, CSR_HPMCOUNTER27H,
               CSR_HPMCOUNTER28H, CSR_HPMCOUNTER29H, CSR_HPMCOUNTER30H, CSR_HPMCOUNTER31H :
                 // Read-only and readable from user mode only if the bit of mcounteren is set
-                if ((csr_op != CSR_OP_READ) ||
-                    (PULP_SECURE && (current_priv_lvl_i != PRIV_LVL_M) && !mcounteren_i[instr_rdata_i[24:20]])) begin
+                if((csr_op != CSR_OP_READ) || (PULP_SECURE && (current_priv_lvl_i != PRIV_LVL_M) && !mcounteren_i[instr_rdata_i[24:20]])) begin
                   csr_illegal = 1'b1;
                 end else begin
                   csr_status_o = 1'b1;
@@ -2886,22 +2802,22 @@ module cv32e40p_decoder
 
             // This register only exists in user mode
             CSR_MCOUNTEREN :
-                if (!PULP_SECURE) begin
-                  csr_illegal = 1'b1;
-                end else begin
-                  csr_status_o = 1'b1;
-                end
+              if(!PULP_SECURE) begin
+                csr_illegal = 1'b1;
+              end else begin
+                csr_status_o = 1'b1;
+              end
 
             // Debug register access
             CSR_DCSR,
               CSR_DPC,
               CSR_DSCRATCH0,
               CSR_DSCRATCH1 :
-                if (!debug_mode_i) begin
+                if(!debug_mode_i) begin
                   csr_illegal = 1'b1;
-                end else begin
-                  csr_status_o = 1'b1;
-                end
+              end else begin
+                csr_status_o = 1'b1;
+              end
 
             // Debug Trigger register access
             CSR_TSELECT,
@@ -2911,35 +2827,35 @@ module cv32e40p_decoder
               CSR_TINFO,
               CSR_MCONTEXT,
               CSR_SCONTEXT :
-                if (DEBUG_TRIGGER_EN != 1)
+                if(DEBUG_TRIGGER_EN != 1)
                   csr_illegal = 1'b1;
 
-            // Hardware Loop register
+            // Hardware Loop register, UHARTID access
             CSR_LPSTART0,
               CSR_LPEND0,
               CSR_LPCOUNT0,
               CSR_LPSTART1,
               CSR_LPEND1,
-              CSR_LPCOUNT1:
-                if (!COREV_PULP || csr_op != CSR_OP_READ) csr_illegal = 1'b1;
-
-            // UHARTID access
-            CSR_UHARTID :
-                if (!COREV_PULP || csr_op != CSR_OP_READ) csr_illegal = 1'b1;
+              CSR_LPCOUNT1,
+              CSR_UHARTID :
+                if(!PULP_XPULP) csr_illegal = 1'b1;
 
             // PRIVLV access
             CSR_PRIVLV :
-                if (!COREV_PULP || csr_op != CSR_OP_READ) begin
-                  csr_illegal = 1'b1;
-                end else begin
-                  csr_status_o = 1'b1;
-                end
+              if(!PULP_XPULP) begin
+                csr_illegal = 1'b1;
+              end else begin
+                csr_status_o = 1'b1;
+              end
 
-            // ZFINX
-            CSR_ZFINX :
-                if (!COREV_PULP || (FPU && !ZFINX) || csr_op != CSR_OP_READ) begin
-                  csr_illegal = 1'b1;
-                end
+            // Instruction-category counter access
+            CSR_CAT_ARITH,
+              CSR_CAT_LOGIC,
+              CSR_CAT_MEMORY,
+              CSR_CAT_BRANCH,
+              CSR_CAT_JUMP,
+              CSR_CAT_FLOAT :
+                csr_status_o = 1'b1;
 
             // PMP register access
             CSR_PMPCFG0,
@@ -2962,7 +2878,7 @@ module cv32e40p_decoder
               CSR_PMPADDR13,
               CSR_PMPADDR14,
               CSR_PMPADDR15 :
-                if (!USE_PMP) csr_illegal = 1'b1;
+                if(!USE_PMP) csr_illegal = 1'b1;
 
             // User register access
             CSR_USTATUS,
@@ -2982,9 +2898,99 @@ module cv32e40p_decoder
           illegal_insn_o = csr_illegal;
 
         end
+
       end
-      default: illegal_insn_o = 1'b1;
+
+
+      ///////////////////////////////////////////////
+      //  _   ___        ___     ___   ___  ____   //
+      // | | | \ \      / / |   / _ \ / _ \|  _ \  //
+      // | |_| |\ \ /\ / /| |  | | | | | | | |_) | //
+      // |  _  | \ V  V / | |__| |_| | |_| |  __/  //
+      // |_| |_|  \_/\_/  |_____\___/ \___/|_|     //
+      //                                           //
+      ///////////////////////////////////////////////
+
+      OPCODE_HWLOOP: begin
+        if(PULP_XPULP) begin : HWLOOP_FEATURE_ENABLED
+          hwlp_target_mux_sel_o = 1'b0;
+
+          unique case (instr_rdata_i[14:12])
+            3'b000: begin
+              // lp.starti: set start address to PC + I-type immediate
+              hwlp_we[0]           = 1'b1;
+              hwlp_start_mux_sel_o = 1'b0;
+              if(instr_rdata_i[19:15] != 5'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
+            3'b001: begin
+              // lp.endi: set end address to PC + I-type immediate
+              hwlp_we[1]         = 1'b1;
+              if(instr_rdata_i[19:15] != 5'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
+            3'b010: begin
+              // lp.count: initialize counter from rs1
+              hwlp_we[2]         = 1'b1;
+              hwlp_cnt_mux_sel_o = 1'b1;
+              rega_used_o        = 1'b1;
+              if(instr_rdata_i[31:20] != 12'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
+            3'b011: begin
+              // lp.counti: initialize counter from I-type immediate
+              hwlp_we[2]         = 1'b1;
+              hwlp_cnt_mux_sel_o = 1'b0;
+              if(instr_rdata_i[19:15] != 5'b0) begin
+                illegal_insn_o = 1'b1;
+              end
+            end
+
+            3'b100: begin
+              // lp.setup: initialize counter from rs1, set start address to
+              // next instruction and end address to PC + I-type immediate
+              hwlp_we              = 3'b111;
+              hwlp_start_mux_sel_o = 1'b1;
+              hwlp_cnt_mux_sel_o   = 1'b1;
+              rega_used_o          = 1'b1;
+            end
+
+            3'b101: begin
+              // lp.setupi: initialize counter from immediate, set start address to
+              // next instruction and end address to PC + I-type immediate
+              hwlp_we               = 3'b111;
+              hwlp_target_mux_sel_o = 1'b1;
+              hwlp_start_mux_sel_o  = 1'b1;
+              hwlp_cnt_mux_sel_o    = 1'b0;
+            end
+
+            default: begin
+              illegal_insn_o = 1'b1;
+            end
+          endcase // case (instr_rdata_i[14:12])
+
+          if(instr_rdata_i[11:8] != 4'b0) begin
+            illegal_insn_o = 1'b1;
+          end
+
+
+
+        end else begin // block: HWLOOP_FEATURE_ENABLED
+          illegal_insn_o = 1'b1;
+        end
+      end // case: OPCODE_HWLOOP
+
+      default: begin
+        illegal_insn_o = 1'b1;
+      end
     endcase
+
 
     // make sure invalid compressed instruction causes an exception
     if (illegal_c_insn_i) begin
@@ -2995,9 +3001,9 @@ module cv32e40p_decoder
 
   // deassert we signals (in case of stalls)
   assign alu_en_o                    = (deassert_we_i) ? 1'b0          : alu_en;
+  assign apu_en_o                    = (deassert_we_i) ? 1'b0          : apu_en;
   assign mult_int_en_o               = (deassert_we_i) ? 1'b0          : mult_int_en;
   assign mult_dot_en_o               = (deassert_we_i) ? 1'b0          : mult_dot_en;
-  assign apu_en_o                    = (deassert_we_i) ? 1'b0          : apu_en;
   assign regfile_mem_we_o            = (deassert_we_i) ? 1'b0          : regfile_mem_we;
   assign regfile_alu_we_o            = (deassert_we_i) ? 1'b0          : regfile_alu_we;
   assign data_req_o                  = (deassert_we_i) ? 1'b0          : data_req;
