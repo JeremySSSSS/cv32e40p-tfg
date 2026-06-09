@@ -280,6 +280,21 @@ package cv32e40p_pkg;
     // ZFINX
     CSR_ZFINX = 12'hCD2,  // Custom CSR. ZFINX
 
+    // Instruction-category counters. Each 64-bit counter is exposed as two
+    // 32-bit CSRs because CV32E40P is an RV32 core.
+    CSR_CAT_ARITH_LO  = 12'hBC0,  // Custom CSR. Arithmetic counter low word
+    CSR_CAT_ARITH_HI  = 12'hBC1,  // Custom CSR. Arithmetic counter high word
+    CSR_CAT_LOGIC_LO  = 12'hBC2,  // Custom CSR. Logic counter low word
+    CSR_CAT_LOGIC_HI  = 12'hBC3,  // Custom CSR. Logic counter high word
+    CSR_CAT_MEMORY_LO = 12'hBC4,  // Custom CSR. Memory counter low word
+    CSR_CAT_MEMORY_HI = 12'hBC5,  // Custom CSR. Memory counter high word
+    CSR_CAT_BRANCH_LO = 12'hBC6,  // Custom CSR. Branch counter low word
+    CSR_CAT_BRANCH_HI = 12'hBC7,  // Custom CSR. Branch counter high word
+    CSR_CAT_JUMP_LO   = 12'hBC8,  // Custom CSR. Jump counter low word
+    CSR_CAT_JUMP_HI   = 12'hBC9,  // Custom CSR. Jump counter high word
+    CSR_CAT_FLOAT_LO  = 12'hBCA,  // Custom CSR. Floating-point counter low word
+    CSR_CAT_FLOAT_HI  = 12'hBCB,  // Custom CSR. Floating-point counter high word
+
     ///////////////////////////////////////////////////////
     // Machine CSRs
     ///////////////////////////////////////////////////////

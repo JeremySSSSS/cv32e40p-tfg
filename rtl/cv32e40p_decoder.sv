@@ -2941,6 +2941,21 @@ module cv32e40p_decoder
                   csr_illegal = 1'b1;
                 end
 
+            // Instruction-category counters
+              CSR_CAT_ARITH_LO,
+              CSR_CAT_ARITH_HI,
+              CSR_CAT_LOGIC_LO,
+              CSR_CAT_LOGIC_HI,
+              CSR_CAT_MEMORY_LO,
+              CSR_CAT_MEMORY_HI,
+              CSR_CAT_BRANCH_LO,
+              CSR_CAT_BRANCH_HI,
+              CSR_CAT_JUMP_LO,
+              CSR_CAT_JUMP_HI,
+              CSR_CAT_FLOAT_LO,
+              CSR_CAT_FLOAT_HI :
+                csr_status_o = 1'b1;
+
             // PMP register access
             CSR_PMPCFG0,
               CSR_PMPCFG1,

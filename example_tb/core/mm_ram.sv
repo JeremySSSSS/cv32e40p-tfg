@@ -140,6 +140,20 @@ module mm_ram #(
   logic        rnd_stall_we;
   logic [31:0] rnd_stall_rdata;
 
+  logic [31:0] gpio_mode_q;
+  logic [31:0] gpio_out_q;
+  logic [31:0] pad_io08_cfg_q;
+  logic [31:0] pad_io08_mux_q;
+  logic        power_mark_q;
+  logic        gpio_mode_we;
+  logic        gpio_set_we;
+  logic        gpio_clear_we;
+  logic        pad_io08_cfg_we;
+  logic        pad_io08_mux_we;
+  logic [31:0] gpio_mode_wdata;
+  logic [31:0] pad_io08_cfg_wdata;
+  logic [31:0] pad_io08_mux_wdata;
+
   //signal delayed by random stall
   logic        rnd_stall_instr_req;
   logic        rnd_stall_instr_gnt;
@@ -179,6 +193,14 @@ module mm_ram #(
   localparam AMO_MINU = 5'b11000;
   localparam AMO_MAXU = 5'b11100;
 
+  localparam logic [31:0] GPIO_MODE0_ADDR   = 32'h1A10_1008;
+  localparam logic [31:0] GPIO_SET0_ADDR    = 32'h1A10_1200;
+  localparam logic [31:0] GPIO_CLEAR0_ADDR  = 32'h1A10_1280;
+  localparam logic [31:0] PAD_IO08_CFG_ADDR = 32'h1A12_1044;
+  localparam logic [31:0] PAD_IO08_MUX_ADDR = 32'h1A12_1048;
+  localparam logic [5:0]  PAD_MODE_GPIO     = 6'h0e;
+  localparam logic [1:0]  GPIO_MODE_OUTPUT  = 2'b01;
+
   // uhh, align?
   always_comb data_addr_aligned = {data_addr_i[31:2], 2'b0};
 
@@ -201,6 +223,14 @@ module mm_ram #(
     timer_wdata     = '0;
     timer_reg_valid = '0;
     timer_val_valid = '0;
+    gpio_mode_we    = '0;
+    gpio_set_we     = '0;
+    gpio_clear_we   = '0;
+    pad_io08_cfg_we = '0;
+    pad_io08_mux_we = '0;
+    gpio_mode_wdata = '0;
+    pad_io08_cfg_wdata = '0;
+    pad_io08_mux_wdata = '0;
     sig_end_d       = sig_end_q;
     sig_begin_d     = sig_begin_q;
     rnd_stall_req   = '0;
@@ -291,6 +321,29 @@ module mm_ram #(
           timer_val_valid = '1;
           perip_gnt = 1'b1;
 
+        end else if (data_addr_i == GPIO_MODE0_ADDR) begin
+          gpio_mode_we    = 1'b1;
+          gpio_mode_wdata = data_wdata_i;
+          perip_gnt       = 1'b1;
+
+        end else if (data_addr_i == GPIO_SET0_ADDR) begin
+          gpio_set_we = 1'b1;
+          perip_gnt   = 1'b1;
+
+        end else if (data_addr_i == GPIO_CLEAR0_ADDR) begin
+          gpio_clear_we = 1'b1;
+          perip_gnt     = 1'b1;
+
+        end else if (data_addr_i == PAD_IO08_CFG_ADDR) begin
+          pad_io08_cfg_we    = 1'b1;
+          pad_io08_cfg_wdata = data_wdata_i;
+          perip_gnt          = 1'b1;
+
+        end else if (data_addr_i == PAD_IO08_MUX_ADDR) begin
+          pad_io08_mux_we    = 1'b1;
+          pad_io08_mux_wdata = data_wdata_i;
+          perip_gnt          = 1'b1;
+
           // write to rnd stall regs
         end else if (data_addr_i[31:16] == 16'h1600) begin
           rnd_stall_req   = data_req_i;
@@ -358,6 +411,11 @@ module mm_ram #(
       || data_addr_i == 32'h1000_0000
       || data_addr_i == 32'h1500_0000
       || data_addr_i == 32'h1500_0004
+      || data_addr_i == GPIO_MODE0_ADDR
+      || data_addr_i == GPIO_SET0_ADDR
+      || data_addr_i == GPIO_CLEAR0_ADDR
+      || data_addr_i == PAD_IO08_CFG_ADDR
+      || data_addr_i == PAD_IO08_MUX_ADDR
       || data_addr_i == 32'h2000_0000
       || data_addr_i == 32'h2000_0004
       || data_addr_i == 32'h2000_0008
@@ -418,13 +476,28 @@ module mm_ram #(
       timer_irq_mask_q <= '0;
       timer_cnt_q      <= '0;
       irq_timer_q      <= '0;
+      gpio_mode_q      <= '0;
+      gpio_out_q       <= '0;
+      pad_io08_cfg_q   <= '0;
+      pad_io08_mux_q   <= '0;
       for (int i = 0; i < RND_STALL_REGS; i++) begin
         rnd_stall_regs[i] <= '0;
       end
       rnd_stall_rdata <= '0;
     end else begin
+      if (gpio_mode_we) begin
+        gpio_mode_q <= gpio_mode_wdata;
+      end else if (gpio_set_we) begin
+        gpio_out_q <= gpio_out_q | data_wdata_i;
+      end else if (gpio_clear_we) begin
+        gpio_out_q <= gpio_out_q & ~data_wdata_i;
+      end else if (pad_io08_cfg_we) begin
+        pad_io08_cfg_q <= pad_io08_cfg_wdata;
+      end else if (pad_io08_mux_we) begin
+        pad_io08_mux_q <= pad_io08_mux_wdata;
+
       // set timer irq mask
-      if (timer_reg_valid) begin
+      end else if (timer_reg_valid) begin
         timer_irq_mask_q <= timer_wdata;
 
         // write timer value
@@ -444,6 +517,13 @@ module mm_ram #(
       end
     end
   end
+
+  assign power_mark_q =
+      (pad_io08_mux_q[5:0] == PAD_MODE_GPIO) &&
+      pad_io08_cfg_q[3] &&
+      pad_io08_cfg_q[0] &&
+      (gpio_mode_q[17:16] == GPIO_MODE_OUTPUT) &&
+      gpio_out_q[8];
 
   // show writes if requested
   always_ff @(posedge clk_i, negedge rst_ni) begin : verbose_writes
